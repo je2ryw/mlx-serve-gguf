@@ -27,7 +27,9 @@ pub const Hparams = struct {
         const pos = f.tensors.get("v.position_embd.weight") orelse return error.MissingMetadata;
         var temporal: u32 = 1;
         var name_buf: [64]u8 = undefined;
-        while (f.tensors.get(std.fmt.bufPrint(&name_buf, "v.patch_embd.weight.{d}", .{temporal}) catch unreachable) != null) temporal += 1;
+        while (f.tensors.get(std.fmt.bufPrint(&name_buf, "v.patch_embd.weight.{d}", .{temporal}) catch unreachable)) |slice| : (temporal += 1) {
+            if (slice.ty != patch.ty or !std.mem.eql(u64, &slice.dims, &patch.dims)) return error.BadMetadata;
+        }
         const hp = Hparams{
             .depth = try u32Key(f, "clip.vision.block_count"),
             .hidden = try u32Key(f, "clip.vision.embedding_length"),
@@ -44,6 +46,9 @@ pub const Hparams = struct {
         if (patch.n_dims != 4 or !std.mem.eql(u64, &patch.dims, &want_patch)) return error.BadMetadata;
         if (pos.n_dims != 2 or pos.dims[0] != hp.hidden) return error.BadMetadata;
         if (hp.depth == 0 or hp.heads == 0 or hp.hidden % hp.heads != 0 or hp.merge == 0) return error.BadMetadata;
+        // The tower interpolates the table as a square grid of positions.
+        const side = std.math.sqrt(hp.num_pos);
+        if (side * side != hp.num_pos) return error.BadMetadata;
         return hp;
     }
 
@@ -278,6 +283,10 @@ pub const TestTower = struct {
     deepstack: bool = false,
     /// A tensor no Qwen3-VL tower has.
     extra_tensor: ?[]const u8 = null,
+    /// The second patch slice stored as f16 instead of the first one's f32.
+    mismatched_slice: bool = false,
+    /// Rows of the position table; a tower's grid is its square root.
+    positions: u64 = num_pos,
 
     pub const hidden = 4;
     pub const ffn = 8;
@@ -329,10 +338,12 @@ pub const TestTower = struct {
         for ([_][]const u8{ "v.patch_embd.weight", "v.patch_embd.weight.1" }, 0..) |name, t| {
             const v = try ar.alloc(f32, patch_n);
             for (v, 0..) |*x, i| x.* = patchValue(t, i);
-            try tensors.append(ar, .{ .name = name, .dims = &.{ patch, patch, 3, h }, .ty = .f32, .data = std.mem.sliceAsBytes(v) });
+            const f16_slice = self.mismatched_slice and t == 1;
+            const data = std.mem.sliceAsBytes(v);
+            try tensors.append(ar, .{ .name = name, .dims = &.{ patch, patch, 3, h }, .ty = if (f16_slice) .f16 else .f32, .data = if (f16_slice) data[0 .. data.len / 2] else data });
         }
         try tensors.append(ar, .{ .name = "v.patch_embd.bias", .dims = try ar.dupe(u64, &.{h}), .ty = .f32, .data = try f32Data(ar, h, 3) });
-        try tensors.append(ar, .{ .name = "v.position_embd.weight", .dims = try ar.dupe(u64, &.{ h, num_pos }), .ty = .f32, .data = try f32Data(ar, h * num_pos, 4) });
+        try tensors.append(ar, .{ .name = "v.position_embd.weight", .dims = try ar.dupe(u64, &.{ h, self.positions }), .ty = .f32, .data = try f32Data(ar, h * self.positions, 4) });
         try tensors.append(ar, .{ .name = "v.post_ln.weight", .dims = try ar.dupe(u64, &.{h}), .ty = .f32, .data = try f32Data(ar, h, 5) });
         try tensors.append(ar, .{ .name = "v.post_ln.bias", .dims = try ar.dupe(u64, &.{h}), .ty = .f32, .data = try f32Data(ar, h, 6) });
         try tensors.append(ar, .{ .name = "mm.0.weight", .dims = try ar.dupe(u64, &.{ merged, merged }), .ty = .bf16, .data = try bf16Data(ar, merged * merged) });
@@ -449,6 +460,8 @@ test "a valid tower pairs with its model; every other file is declined by name" 
         .{ .{ .projector = "mlp" }, 6, "projector_type mlp" },
         .{ .{ .extra_tensor = "v.blk.0.attn_q.weight" }, 6, "tensor v.blk.0.attn_q.weight" },
         .{ .{}, 8, "projection_dim 6 is not the model's hidden size 8" },
+        .{ .{ .mismatched_slice = true }, 6, "metadata (BadMetadata)" },
+        .{ .{ .positions = 6 }, 6, "metadata (BadMetadata)" },
     };
     for (cases) |c| {
         var mm_bytes: []u8 = undefined;
@@ -496,9 +509,9 @@ test "the config fragment mirrors an HF checkpoint's vision_config and token ids
     try std.testing.expectEqualStrings("qwen3_5", vc.get("model_type").?.string);
     try std.testing.expectEqual(@as(usize, 0), vc.get("deepstack_visual_indexes").?.array.items.len);
     const want = [_]struct { []const u8, i64 }{
-        .{ "depth", 2 },                           .{ "hidden_size", TestTower.hidden },  .{ "intermediate_size", TestTower.ffn },
-        .{ "num_heads", 2 },                       .{ "num_position_embeddings", TestTower.num_pos }, .{ "out_hidden_size", 6 },
-        .{ "patch_size", TestTower.patch },        .{ "spatial_merge_size", 2 },          .{ "temporal_patch_size", 2 },
+        .{ "depth", 2 },                    .{ "hidden_size", TestTower.hidden },              .{ "intermediate_size", TestTower.ffn },
+        .{ "num_heads", 2 },                .{ "num_position_embeddings", TestTower.num_pos }, .{ "out_hidden_size", 6 },
+        .{ "patch_size", TestTower.patch }, .{ "spatial_merge_size", 2 },                      .{ "temporal_patch_size", 2 },
         .{ "in_channels", 3 },
     };
     for (want) |w| try std.testing.expectEqual(w[1], vc.get(w[0]).?.integer);
