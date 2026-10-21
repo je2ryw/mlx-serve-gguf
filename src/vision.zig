@@ -378,9 +378,25 @@ pub const TestTower = struct {
 /// holds the four vision tokens (ids 3..6): enough metadata for the config,
 /// tokenizer and vision pairing, nothing to run. Caller frees.
 pub fn writeTestLlm(a: std.mem.Allocator, hidden: u32) ![]u8 {
-    return writeTestGguf(a, &.{
+    return writeTestModel(a, .{ .hidden = hidden });
+}
+
+/// What a test language model varies from `writeTestLlm`'s.
+pub const TestLlm = struct {
+    hidden: u32,
+    /// Blocks after the 4 trunk layers that hold the MTP head (`nextn_predict_layers`).
+    nextn: u32 = 0,
+    tensors: []const TestTensor = &.{},
+};
+
+pub fn writeTestModel(a: std.mem.Allocator, opts: TestLlm) ![]u8 {
+    const hidden = opts.hidden;
+    var kvs: std.ArrayList(struct { []const u8, TestKv }) = .empty;
+    defer kvs.deinit(a);
+    if (opts.nextn > 0) try kvs.append(a, .{ "qwen35.nextn_predict_layers", .{ .u32 = opts.nextn } });
+    try kvs.appendSlice(a, &.{
         .{ "general.architecture", .{ .str = "qwen35" } },
-        .{ "qwen35.block_count", .{ .u32 = 4 } },
+        .{ "qwen35.block_count", .{ .u32 = 4 + opts.nextn } },
         .{ "qwen35.context_length", .{ .u32 = 4096 } },
         .{ "qwen35.embedding_length", .{ .u32 = hidden } },
         .{ "qwen35.feed_forward_length", .{ .u32 = 16 } },
@@ -404,7 +420,8 @@ pub fn writeTestLlm(a: std.mem.Allocator, hidden: u32) ![]u8 {
         .{ "tokenizer.ggml.merges", .{ .strs = &.{"a b"} } },
         .{ "tokenizer.ggml.eos_token_id", .{ .u32 = 2 } },
         .{ "tokenizer.chat_template", .{ .str = "{{ messages[0]['content'] }}" } },
-    }, &.{});
+    });
+    return writeTestGguf(a, kvs.items, opts.tensors);
 }
 
 fn testFiles(tower: TestTower, llm_hidden: u32, mm_bytes: *[]u8, llm_bytes: *[]u8) !struct { gguf.File, gguf.File } {

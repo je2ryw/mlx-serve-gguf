@@ -31,6 +31,31 @@ pub fn load(allocator: std.mem.Allocator, f: *const gguf.File, out: *WeightMap, 
     }
 }
 
+/// The MTP head a dense qwen35 file keeps after its trunk (`qwen35.hasMtpHead`),
+/// loaded like the trunk under the `language_model.mtp.*` names (keys owned by
+/// `allocator`). Every head leaf is checked before any loads.
+pub fn loadMtp(allocator: std.mem.Allocator, f: *const gguf.File, out: *WeightMap, s: mlx.mlx_stream) !void {
+    const arch = try Arch.read(f);
+    if (arch != .qwen35 or !qwen35.hasMtpHead(f, arch.qwen35)) return error.NoMtpHead;
+    const hp = arch.qwen35;
+    var name_buf: [160]u8 = undefined;
+    for ([_]bool{ false, true }) |load_now| {
+        var it = f.tensors.iterator();
+        while (it.next()) |e| {
+            const b = arch_mod.splitLayer(e.key_ptr.*, hp.n_layers + 1) orelse continue;
+            if (b.layer != hp.n_layers) continue;
+            const mapped = qwen35.mapMtpTensor(&name_buf, e.key_ptr.*, hp) orelse return error.UnsupportedTensor;
+            if (!load_now) continue;
+            const t = e.value_ptr.*;
+            if (t.ty.isQuantized()) {
+                try loadQuantized(allocator, t, mapped, hp, out, s);
+            } else {
+                try put(allocator, out, mapped.name, try loadFloat(allocator, t, mapped.transform, hp, s));
+            }
+        }
+    }
+}
+
 /// The tower of an mmproj `vision.unsupportedReason` accepted, as the dense
 /// bf16 `model.visual.*` tensors of an HF checkpoint (keys owned by `allocator`).
 pub fn loadVision(allocator: std.mem.Allocator, mm: *const gguf.File, out: *WeightMap, s: mlx.mlx_stream) !void {
@@ -359,6 +384,85 @@ test "an mmproj tower loads as bf16 model.visual.* tensors, patch slices stacked
     for (0..h * 3) |oc| for (0..2) |t| for (0..p * p) |yx| {
         try std.testing.expectEqual(Tower.patchValue(t, oc * p * p + yx), got[(oc * 2 + t) * p * p + yx]);
     };
+}
+
+/// A qwen35 test model (hidden 32) whose blk.4 is a 15-tensor MTP head, its matrices Q8_0, plus `extra`.
+fn writeTestHeadModel(a: std.mem.Allocator, extra: ?[]const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    var tensors: std.ArrayList(vision.TestTensor) = .empty;
+    const mats = [_]struct { []const u8, u64, u64 }{
+        .{ "nextn.eh_proj", 64, 32 }, .{ "attn_q", 32, 16 },   .{ "attn_k", 32, 8 },  .{ "attn_v", 32, 8 },
+        .{ "attn_output", 32, 32 },   .{ "ffn_gate", 32, 64 }, .{ "ffn_up", 32, 64 }, .{ "ffn_down", 64, 32 },
+    };
+    for (mats) |m| {
+        const data = try ar.alloc(u8, m[2] * m[1] / 32 * 34);
+        @memset(data, 0);
+        try tensors.append(ar, .{ .name = try std.fmt.allocPrint(ar, "blk.4.{s}.weight", .{m[0]}), .dims = try ar.dupe(u64, &.{ m[1], m[2] }), .ty = .q8_0, .data = data });
+    }
+    const norms = [_]struct { []const u8, u64 }{
+        .{ "nextn.enorm", 32 },         .{ "nextn.hnorm", 32 }, .{ "nextn.shared_head_norm", 32 }, .{ "attn_norm", 32 },
+        .{ "post_attention_norm", 32 }, .{ "attn_q_norm", 4 },  .{ "attn_k_norm", 4 },
+    };
+    for (norms ++ [_]struct { []const u8, u64 }{.{ extra orelse "", 32 }}) |n| {
+        if (n[0].len == 0) continue;
+        const v = try ar.alloc(f32, n[1]);
+        @memset(v, 1.5);
+        try tensors.append(ar, .{ .name = try std.fmt.allocPrint(ar, "blk.4.{s}.weight", .{n[0]}), .dims = try ar.dupe(u64, &.{n[1]}), .ty = .f32, .data = std.mem.sliceAsBytes(v) });
+    }
+    return vision.writeTestModel(a, .{ .hidden = 32, .nextn = 1, .tensors = tensors.items });
+}
+
+test "the MTP block loads as the language_model.mtp.* head, quantized weights with their sentinel" {
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const bytes = try writeTestHeadModel(a, null);
+    defer a.free(bytes);
+    var f = try gguf.File.parse(a, bytes);
+    defer f.deinit();
+    var map = WeightMap.init(a);
+    defer {
+        var it = map.iterator();
+        while (it.next()) |e| {
+            _ = mlx.mlx_array_free(e.value_ptr.*);
+            a.free(e.key_ptr.*);
+        }
+        map.deinit();
+    }
+    try loadMtp(a, &f, &map, s);
+    // 15 tensors, and a `.scales` sentinel beside each of the 8 quantized ones.
+    try std.testing.expectEqual(@as(u32, 15 + 8), map.count());
+    var it = map.iterator();
+    while (it.next()) |e| try std.testing.expect(std.mem.startsWith(u8, e.key_ptr.*, "language_model.mtp."));
+    const fc = kernels.infoOf(map.get("language_model.mtp.fc.weight").?, map.get("language_model.mtp.fc.scales").?) orelse return error.TestNotGguf;
+    try std.testing.expectEqual(@import("quants.zig").GgmlType.q8_0, fc.ty);
+    const norm = map.get("language_model.mtp.layers.0.self_attn.q_norm.weight").?;
+    try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(norm));
+    try std.testing.expectEqualSlices(c_int, &.{4}, mlx.getShape(norm));
+
+    // No head, or a head leaf the map does not know: nothing half-loaded.
+    const plain = try vision.writeTestModel(a, .{ .hidden = 32 });
+    defer a.free(plain);
+    var pf = try gguf.File.parse(a, plain);
+    defer pf.deinit();
+    try std.testing.expectError(error.NoMtpHead, loadMtp(a, &pf, &map, s));
+    const odd = try writeTestHeadModel(a, "nextn.embed_tokens");
+    defer a.free(odd);
+    var of = try gguf.File.parse(a, odd);
+    defer of.deinit();
+    var odd_map = WeightMap.init(a);
+    defer {
+        var oit = odd_map.iterator();
+        while (oit.next()) |e| {
+            _ = mlx.mlx_array_free(e.value_ptr.*);
+            a.free(e.key_ptr.*);
+        }
+        odd_map.deinit();
+    }
+    try std.testing.expectError(error.UnsupportedTensor, loadMtp(a, &of, &odd_map, s));
+    try std.testing.expectEqual(@as(u32, 0), odd_map.count());
 }
 
 test "an mmproj tower is bit-equal to an MLX pack of the same checkpoint (set MLX_SERVE_GGUF_VISION_MMPROJ, MLX_SERVE_GGUF_VISION_ORACLE)" {

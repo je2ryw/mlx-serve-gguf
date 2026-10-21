@@ -180,10 +180,42 @@ pub fn mapTensor(buf: []u8, name: []const u8, hp: Hparams) ?arch.Mapped {
     };
     for (globals) |g| if (std.mem.eql(u8, name, g[0])) return .{ .name = g[1], .transform = .none };
 
-    // The MTP head is the block right after the trunk.
+    // The MTP head is the block right after the trunk, loaded on its own (`mapMtpTensor`).
     if (arch.splitLayer(name, hp.n_layers + 1)) |b| if (b.layer == hp.n_layers) return arch.skip;
     const blk = arch.splitLayer(name, hp.n_layers) orelse return null;
+    const row = layerLeaf(blk.leaf, hp) orelse return null;
+    const full = std.fmt.bufPrint(buf, prefix ++ "layers.{d}.{s}", .{ blk.layer, row.name }) catch return null;
+    return .{ .name = full, .transform = row.transform };
+}
 
+/// The MTP block llama.cpp keeps after the trunk (`blk.<n_layers>`: the `nextn.*`
+/// projections + one full-attention layer) under the `language_model.mtp.*` names
+/// mlx-serve's Qwen head loader binds; null for any other tensor or head leaf.
+pub fn mapMtpTensor(buf: []u8, name: []const u8, hp: Hparams) ?arch.Mapped {
+    const b = arch.splitLayer(name, hp.n_layers + 1) orelse return null;
+    if (b.layer != hp.n_layers) return null;
+    const mtp = "language_model.mtp.";
+    const nextn = [_]struct { []const u8, []const u8 }{
+        .{ "nextn.eh_proj.weight", mtp ++ "fc.weight" },
+        .{ "nextn.enorm.weight", mtp ++ "pre_fc_norm_embedding.weight" },
+        .{ "nextn.hnorm.weight", mtp ++ "pre_fc_norm_hidden.weight" },
+        .{ "nextn.shared_head_norm.weight", mtp ++ "norm.weight" },
+    };
+    for (nextn) |n| if (std.mem.eql(u8, b.leaf, n[0])) return .{ .name = n[1], .transform = .none };
+    const row = layerLeaf(b.leaf, hp) orelse return null;
+    const full = std.fmt.bufPrint(buf, mtp ++ "layers.0.{s}", .{row.name}) catch return null;
+    return .{ .name = full, .transform = row.transform };
+}
+
+/// The file carries a dense trunk's own MTP head; a MoE head is not mapped yet.
+pub fn hasMtpHead(f: *const gguf.File, hp: Hparams) bool {
+    if (hp.n_experts > 0) return false;
+    var buf: [64]u8 = undefined;
+    return f.tensors.get(std.fmt.bufPrint(&buf, "blk.{d}.nextn.eh_proj.weight", .{hp.n_layers}) catch return false) != null;
+}
+
+/// A layer leaf's HF name under `layers.<n>.` and its load transform.
+fn layerLeaf(leaf: []const u8, hp: Hparams) ?struct { name: []const u8, transform: Transform } {
     const v_rows = Transform{ .untile_rows = .{ .start = 0, .unit = hp.dv } };
     const head_rows = Transform{ .untile_rows = .{ .start = 0, .unit = 1 } };
     const table = [_]struct { []const u8, []const u8, Transform }{
@@ -217,8 +249,7 @@ pub fn mapTensor(buf: []u8, name: []const u8, hp: Hparams) ?arch.Mapped {
         .{ "ssm_norm.weight", "linear_attn.norm.weight", .none },
         .{ "ssm_out.weight", "linear_attn.out_proj.weight", .tiled_input },
     };
-    for (table) |row| if (std.mem.eql(u8, blk.leaf, row[0])) {
-        const full = std.fmt.bufPrint(buf, prefix ++ "layers.{d}.{s}", .{ blk.layer, row[1] }) catch return null;
+    for (table) |row| if (std.mem.eql(u8, leaf, row[0])) {
         // With one value head per key head the tiled and grouped orders coincide.
         const t: Transform = if (hp.r() == 1) switch (row[2]) {
             .a_log => .a_log,
@@ -226,7 +257,7 @@ pub fn mapTensor(buf: []u8, name: []const u8, hp: Hparams) ?arch.Mapped {
             .shared_gate => .shared_gate,
             else => .none,
         } else row[2];
-        return .{ .name = full, .transform = t };
+        return .{ .name = row[1], .transform = t };
     };
     return null;
 }
@@ -264,6 +295,42 @@ test "mapTensor names layers and picks the un-tiling transform" {
     try std.testing.expect(mapTensor(&buf, "blk.2.attn_qkv.weight", hp).?.transform == .none);
     try std.testing.expect(mapTensor(&buf, "blk.1.ffn_gate_inp_shexp.weight", hp).?.transform == .shared_gate);
     try std.testing.expect(mapTensor(&buf, "blk.2.ssm_a", hp).?.transform == .a_log);
+}
+
+test "the MTP block maps to the head names of an MLX pack of the same model" {
+    var hp = std.mem.zeroes(Hparams);
+    hp.n_layers = 64;
+    hp.nk = 16;
+    hp.nv = 48;
+    // Qwen3.8-27B's blk.64, and what Qwen3.8-27B-MLX-Serve-8bit names each tensor.
+    const want = [_]struct { []const u8, []const u8 }{
+        .{ "blk.64.nextn.eh_proj.weight", "language_model.mtp.fc.weight" },
+        .{ "blk.64.nextn.enorm.weight", "language_model.mtp.pre_fc_norm_embedding.weight" },
+        .{ "blk.64.nextn.hnorm.weight", "language_model.mtp.pre_fc_norm_hidden.weight" },
+        .{ "blk.64.nextn.shared_head_norm.weight", "language_model.mtp.norm.weight" },
+        .{ "blk.64.attn_norm.weight", "language_model.mtp.layers.0.input_layernorm.weight" },
+        .{ "blk.64.post_attention_norm.weight", "language_model.mtp.layers.0.post_attention_layernorm.weight" },
+        .{ "blk.64.attn_q.weight", "language_model.mtp.layers.0.self_attn.q_proj.weight" },
+        .{ "blk.64.attn_k.weight", "language_model.mtp.layers.0.self_attn.k_proj.weight" },
+        .{ "blk.64.attn_v.weight", "language_model.mtp.layers.0.self_attn.v_proj.weight" },
+        .{ "blk.64.attn_output.weight", "language_model.mtp.layers.0.self_attn.o_proj.weight" },
+        .{ "blk.64.attn_q_norm.weight", "language_model.mtp.layers.0.self_attn.q_norm.weight" },
+        .{ "blk.64.attn_k_norm.weight", "language_model.mtp.layers.0.self_attn.k_norm.weight" },
+        .{ "blk.64.ffn_gate.weight", "language_model.mtp.layers.0.mlp.gate_proj.weight" },
+        .{ "blk.64.ffn_up.weight", "language_model.mtp.layers.0.mlp.up_proj.weight" },
+        .{ "blk.64.ffn_down.weight", "language_model.mtp.layers.0.mlp.down_proj.weight" },
+    };
+    var buf: [160]u8 = undefined;
+    for (want) |w| {
+        const m = mapMtpTensor(&buf, w[0], hp) orelse return error.TestUnmapped;
+        try std.testing.expectEqualStrings(w[1], m.name);
+        try std.testing.expect(m.transform == .none);
+    }
+    // The trunk keeps its own names; an unknown head leaf is no head tensor.
+    for ([_][]const u8{ "blk.63.attn_q.weight", "blk.64.nextn.embed_tokens.weight", "blk.65.attn_q.weight", "token_embd.weight" }) |name|
+        try std.testing.expect(mapMtpTensor(&buf, name, hp) == null);
+    try std.testing.expectEqualStrings("language_model.model.layers.63.self_attn.q_proj.weight", mapTensor(&buf, "blk.63.attn_q.weight", hp).?.name);
+    try std.testing.expectEqual(@as(usize, 0), mapTensor(&buf, "blk.64.attn_q.weight", hp).?.name.len);
 }
 
 test "configJson is valid JSON with the GDN geometry" {
