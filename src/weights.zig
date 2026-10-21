@@ -386,39 +386,11 @@ test "an mmproj tower loads as bf16 model.visual.* tensors, patch slices stacked
     };
 }
 
-/// A qwen35 test model (hidden 32) whose blk.4 is a 15-tensor MTP head, its matrices Q8_0, plus `extra`.
-fn writeTestHeadModel(a: std.mem.Allocator, extra: ?[]const u8) ![]u8 {
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    const ar = arena.allocator();
-    var tensors: std.ArrayList(vision.TestTensor) = .empty;
-    const mats = [_]struct { []const u8, u64, u64 }{
-        .{ "nextn.eh_proj", 64, 32 }, .{ "attn_q", 32, 16 },   .{ "attn_k", 32, 8 },  .{ "attn_v", 32, 8 },
-        .{ "attn_output", 32, 32 },   .{ "ffn_gate", 32, 64 }, .{ "ffn_up", 32, 64 }, .{ "ffn_down", 64, 32 },
-    };
-    for (mats) |m| {
-        const data = try ar.alloc(u8, m[2] * m[1] / 32 * 34);
-        @memset(data, 0);
-        try tensors.append(ar, .{ .name = try std.fmt.allocPrint(ar, "blk.4.{s}.weight", .{m[0]}), .dims = try ar.dupe(u64, &.{ m[1], m[2] }), .ty = .q8_0, .data = data });
-    }
-    const norms = [_]struct { []const u8, u64 }{
-        .{ "nextn.enorm", 32 },         .{ "nextn.hnorm", 32 }, .{ "nextn.shared_head_norm", 32 }, .{ "attn_norm", 32 },
-        .{ "post_attention_norm", 32 }, .{ "attn_q_norm", 4 },  .{ "attn_k_norm", 4 },
-    };
-    for (norms ++ [_]struct { []const u8, u64 }{.{ extra orelse "", 32 }}) |n| {
-        if (n[0].len == 0) continue;
-        const v = try ar.alloc(f32, n[1]);
-        @memset(v, 1.5);
-        try tensors.append(ar, .{ .name = try std.fmt.allocPrint(ar, "blk.4.{s}.weight", .{n[0]}), .dims = try ar.dupe(u64, &.{n[1]}), .ty = .f32, .data = std.mem.sliceAsBytes(v) });
-    }
-    return vision.writeTestModel(a, .{ .hidden = 32, .nextn = 1, .tensors = tensors.items });
-}
-
 test "the MTP block loads as the language_model.mtp.* head, quantized weights with their sentinel" {
     const a = std.testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-    const bytes = try writeTestHeadModel(a, null);
+    const bytes = try vision.writeTestMtpModel(a, null);
     defer a.free(bytes);
     var f = try gguf.File.parse(a, bytes);
     defer f.deinit();
@@ -448,7 +420,7 @@ test "the MTP block loads as the language_model.mtp.* head, quantized weights wi
     var pf = try gguf.File.parse(a, plain);
     defer pf.deinit();
     try std.testing.expectError(error.NoMtpHead, loadMtp(a, &pf, &map, s));
-    const odd = try writeTestHeadModel(a, "nextn.embed_tokens");
+    const odd = try vision.writeTestMtpModel(a, "nextn.embed_tokens");
     defer a.free(odd);
     var of = try gguf.File.parse(a, odd);
     defer of.deinit();

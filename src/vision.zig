@@ -424,6 +424,39 @@ pub fn writeTestModel(a: std.mem.Allocator, opts: TestLlm) ![]u8 {
     return writeTestGguf(a, kvs.items, opts.tensors);
 }
 
+/// A qwen35 test model (hidden 32) whose blk.4 is a 15-tensor MTP head, its
+/// matrices Q8_0 (scale 1/16, codes -3..3), plus the tensor `extra` names. Caller frees.
+pub fn writeTestMtpModel(a: std.mem.Allocator, extra: ?[]const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    var tensors: std.ArrayList(TestTensor) = .empty;
+    const mats = [_]struct { []const u8, u64, u64 }{
+        .{ "nextn.eh_proj", 64, 32 }, .{ "attn_q", 32, 16 },   .{ "attn_k", 32, 8 },  .{ "attn_v", 32, 8 },
+        .{ "attn_output", 32, 32 },   .{ "ffn_gate", 32, 64 }, .{ "ffn_up", 32, 64 }, .{ "ffn_down", 64, 32 },
+    };
+    for (mats) |m| {
+        const data = try ar.alloc(u8, m[2] * m[1] / 32 * 34);
+        for (0..data.len / 34) |blk| {
+            const b = data[blk * 34 ..][0..34];
+            std.mem.writeInt(u16, b[0..2], 0x2C00, .little); // f16 0.0625
+            for (b[2..], 0..) |*q, i| q.* = @bitCast(@as(i8, @intCast(@as(i64, @intCast((blk + i) % 7)) - 3)));
+        }
+        try tensors.append(ar, .{ .name = try std.fmt.allocPrint(ar, "blk.4.{s}.weight", .{m[0]}), .dims = try ar.dupe(u64, &.{ m[1], m[2] }), .ty = .q8_0, .data = data });
+    }
+    const norms = [_]struct { []const u8, u64 }{
+        .{ "nextn.enorm", 32 },         .{ "nextn.hnorm", 32 }, .{ "nextn.shared_head_norm", 32 }, .{ "attn_norm", 32 },
+        .{ "post_attention_norm", 32 }, .{ "attn_q_norm", 4 },  .{ "attn_k_norm", 4 },
+    };
+    for (norms ++ [_]struct { []const u8, u64 }{.{ extra orelse "", 32 }}) |n| {
+        if (n[0].len == 0) continue;
+        const vals = try ar.alloc(f32, n[1]);
+        @memset(vals, 1.5);
+        try tensors.append(ar, .{ .name = try std.fmt.allocPrint(ar, "blk.4.{s}.weight", .{n[0]}), .dims = try ar.dupe(u64, &.{n[1]}), .ty = .f32, .data = std.mem.sliceAsBytes(vals) });
+    }
+    return writeTestModel(a, .{ .hidden = 32, .nextn = 1, .tensors = tensors.items });
+}
+
 fn testFiles(tower: TestTower, llm_hidden: u32, mm_bytes: *[]u8, llm_bytes: *[]u8) !struct { gguf.File, gguf.File } {
     const a = std.testing.allocator;
     mm_bytes.* = try tower.write(a);

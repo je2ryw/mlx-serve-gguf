@@ -408,7 +408,7 @@ fn geometry(ty: GgmlType, w: mlx.mlx_array) Error!struct { rows: c_int, in: c_in
 }
 
 /// Weights per row from the stored row length (see rowBytes).
-fn inFeatures(ty: GgmlType, row_bytes: c_int) Error!c_int {
+pub fn inFeatures(ty: GgmlType, row_bytes: c_int) Error!c_int {
     const bb: c_int = @intCast(ty.blockBytes());
     const in = @divFloor(row_bytes, bb) * @as(c_int, @intCast(ty.blockElems()));
     if (in == 0 or rowBytes(ty, @intCast(in)) != row_bytes) return error.BadShape;

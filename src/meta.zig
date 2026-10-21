@@ -25,6 +25,13 @@ pub fn unsupportedReason(f: *const gguf.File, buf: []u8) ?[]const u8 {
     return null;
 }
 
+/// The file carries its model's own MTP head in a layout the loader maps
+/// (`weights.loadMtp`): a dense qwen35 trunk's `blk.<n_layers>.nextn.*`.
+pub fn hasMtpHead(f: *const gguf.File) bool {
+    const arch = Arch.read(f) catch return false;
+    return arch == .qwen35 and @import("arch.zig").qwen35.hasMtpHead(f, arch.qwen35);
+}
+
 /// With `mmproj` (a tower `vision.unsupportedReason` accepts for this model) the
 /// config also carries its `vision_config` and the vision token ids, as an HF
 /// checkpoint of the same model does; the arch modules never see the tower.
@@ -362,6 +369,17 @@ test "configJson carries an mmproj's vision_config under the model's own model_t
     defer plain.deinit();
     try std.testing.expect(plain.value.object.get("vision_config") == null);
     try std.testing.expect(plain.value.object.get("image_token_id") == null);
+}
+
+test "hasMtpHead: a dense qwen35 file with its blk.<n_layers>.nextn head, not one without" {
+    const a = std.testing.allocator;
+    for ([_]bool{ true, false }) |head| {
+        const bytes = if (head) try vision.writeTestMtpModel(a, null) else try vision.writeTestModel(a, .{ .hidden = 32 });
+        defer a.free(bytes);
+        var f = try gguf.File.parse(a, bytes);
+        defer f.deinit();
+        try std.testing.expectEqual(head, hasMtpHead(&f));
+    }
 }
 
 test "appendJsonString round-trips through the JSON parser" {
