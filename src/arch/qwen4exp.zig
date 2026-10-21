@@ -15,11 +15,9 @@ pub const arch_name = "qwen4exp";
 /// Names follow the native mlx-serve packs of the model.
 const prefix = "language_model.model.";
 
-/// mlx-serve's n-gram hash knobs the GGUF does not state. Its head vocab sizes
-/// are the primes after the base (mlx-serve checks them against the id-math
-/// tensors built from `metadataTensor`), its table rows padded to the divisor
-/// (checked here against the table).
-const ngram_vocab_base = 20_000_000;
+/// mlx-serve's n-gram hash knobs the GGUF does not state: the table rows are
+/// the head sizes padded to the divisor (checked here against the table). The
+/// vocab base is the first head size (`Hparams.ngram_base`).
 const ngram_rows_divisor = 128;
 const split_ngram_parts = 128;
 
@@ -41,6 +39,9 @@ pub const Hparams = struct {
     /// One n-gram head's embedding width: a table row.
     ple_head_dim: u32,
     table_rows: u64,
+    /// The n-gram vocab base: the file states its primes (the head sizes are consecutive primes
+    /// from the first one), so the first head size is a base that yields exactly them.
+    ngram_base: u64,
     /// The n-gram hash's eos (HF's `text_config.eos_token_id`), not the chat terminator.
     ngram_eos: u32,
     bos: u32,
@@ -67,6 +68,7 @@ pub const Hparams = struct {
             .bos = try arch.u32Key(f, "tokenizer.ggml.bos_token_id"),
             .vision = try visionTokens(f),
             .table_rows = (f.tensors.get("per_layer_token_embd.weight") orelse return error.MissingMetadata).dims[1],
+            .ngram_base = 0,
         };
         if (hp.vision.image != try k.int("ple.image_token_id")) return error.BadMetadata;
         const table = f.tensors.get("per_layer_token_embd.weight").?;
@@ -78,7 +80,9 @@ pub const Hparams = struct {
             .vocab_sizes = k.array("ple.head_vocab_sizes") orelse return error.MissingMetadata,
         };
         try ngram.check(hp, table.dims[1]);
-        return hp;
+        var out = hp;
+        out.ngram_base = @intCast(ngram.vocab_sizes.int(0));
+        return out;
     }
 
     /// N-gram heads, refused when the header's counts overflow.
@@ -242,7 +246,7 @@ pub fn configJson(allocator: std.mem.Allocator, hp: Hparams, table: TableFile) !
         .ple_conv = hp.ple_conv_kernel,
         .ngram = hp.ngram_size,
         .hpn = hp.heads_per_ngram,
-        .vocab_base = ngram_vocab_base,
+        .vocab_base = hp.ngram_base,
         .divisor = ngram_rows_divisor,
         .parts = split_ngram_parts,
         .tied = b.tied,
@@ -355,6 +359,7 @@ fn testHparams() Hparams {
         .ple_conv_kernel = 4,
         .ple_head_dim = 160,
         .table_rows = 320001536,
+        .ngram_base = 20000003,
         .ngram_eos = 248044,
         .bos = 248044,
         .vision = .{ .image = 248056, .video = 248057, .start = 248053, .end = 248054 },
@@ -484,6 +489,7 @@ test "configJson carries the native pack's text_config, no MTP and no vision_con
     try std.testing.expectEqual(@as(i64, 2), tc.get("ple_layer_ids").?.array.items[0].integer);
     try std.testing.expectEqual(@as(i64, 2560), tc.get("ple_embed_dim").?.integer);
     try std.testing.expectEqual(@as(i64, 2048), tc.get("indexer_budget").?.integer);
+    try std.testing.expectEqual(@as(i64, 20000003), tc.get("ngram_vocab_size_base").?.integer);
     try std.testing.expectEqual(@as(i64, 4), tc.get("indexer_compress_ratio").?.integer);
     try std.testing.expectEqual(@as(usize, 48), tc.get("layer_types").?.array.items.len);
     try std.testing.expectEqualStrings("full_attention", tc.get("layer_types").?.array.items[47].string);
