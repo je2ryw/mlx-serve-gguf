@@ -34,13 +34,16 @@ Works end to end in mlx-serve, text only, greedy output at parity with llama.cpp
 - Nemotron-H / Nemotron 3 Nano (`nemotron_h`, `nemotron_h_moe`)
 - Qwen3-Next (`qwen3next`): unlike `qwen35` the converter keeps HF head order, fuses b / a (split back at load) and stores the norms as w + 1 (what mlx-lm's checkpoints carry too)
 
-Not done: vision (mmproj), MTP heads (skipped at load).
+Vision: a Qwen3-VL mmproj (`clip`, `qwen3vl_merger`) beside a Qwen3.5 / Qwen3.8 model gives mlx-serve its tower, dense bf16 as the HF checkpoint ships it (checked bit for bit against an MLX pack of the same checkpoint).
+
+Not done: other mmproj projectors (deepstack, Gemma, ...), MTP heads (skipped at load).
 
 What is where:
 
 - GGUF reader (mmap, zero copy): `src/gguf.zig`
 - CPU reference dequant, checked against ggml itself: `src/quants.zig`
 - config.json / tokenizer.json / tokenizer_config.json / generation_config.json rebuilt from the GGUF metadata, in memory: `src/meta.zig`
+- A Qwen3-VL mmproj: its `vision_config` and the `model.visual.*` tensor names in `src/vision.zig`, its bf16 tensors in `weights.loadVision`
 - The arch table (`Arch`: read hparams, config.json, tensor map): `src/arch.zig`, one file per family in `src/arch/`. A new arch is a new file + one line in each of the 3 switches.
 - llama.cpp layout fixes for qwen (tiled value heads, `ssm_a`), expert banks, kernel warmup at load: `src/weights.zig`
 - Metal kernels: `src/kernels.zig`, one decoder file per family in `src/metal/blocks/`, the IQ codebooks in `src/metal/tables/`

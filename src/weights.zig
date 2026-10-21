@@ -7,6 +7,7 @@ const gguf = @import("gguf.zig");
 const kernels = @import("kernels.zig");
 const arch_mod = @import("arch.zig");
 const qwen35 = arch_mod.qwen35;
+const vision = @import("vision.zig");
 const Arch = arch_mod.Arch;
 
 pub const WeightMap = std.StringHashMap(mlx.mlx_array);
@@ -28,6 +29,60 @@ pub fn load(allocator: std.mem.Allocator, f: *const gguf.File, out: *WeightMap, 
             try put(allocator, out, mapped.name, try loadFloat(allocator, t, mapped.transform, hp, s));
         }
     }
+}
+
+/// The tower of an mmproj `vision.unsupportedReason` accepted, as the dense
+/// bf16 `model.visual.*` tensors of an HF checkpoint (keys owned by `allocator`).
+pub fn loadVision(allocator: std.mem.Allocator, mm: *const gguf.File, out: *WeightMap, s: mlx.mlx_stream) !void {
+    const hp = try vision.Hparams.read(mm);
+    const no_tiling = std.mem.zeroes(qwen35.Hparams);
+    var name_buf: [160]u8 = undefined;
+    var it = mm.tensors.iterator();
+    while (it.next()) |e| {
+        const name = vision.mapTensor(&name_buf, e.key_ptr.*, hp) orelse return error.UnsupportedTensor;
+        if (name.len == 0) continue;
+        const arr = if (std.mem.eql(u8, e.key_ptr.*, "v.patch_embd.weight"))
+            try stackPatchSlices(allocator, mm, hp.temporal_patch, s)
+        else
+            try loadFloat(allocator, e.value_ptr.*, .none, no_tiling, s);
+        try put(allocator, out, name, arr);
+    }
+}
+
+/// llama.cpp keeps one [kw, kh, C, hidden] patch kernel per time slice
+/// (`v.patch_embd.weight`, `.weight.1`, ...); HF's Conv3d is one [hidden, C, T, kh, kw].
+fn stackPatchSlices(allocator: std.mem.Allocator, mm: *const gguf.File, temporal: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const first = mm.tensors.get("v.patch_embd.weight") orelse return error.UnsupportedTensor;
+    if (first.n_dims != 4) return error.BadShape;
+    const plane = @as(usize, @intCast(first.dims[0] * first.dims[1])) * first.ty.blockBytes();
+    const planes: usize = @intCast(first.dims[2] * first.dims[3]);
+    const tmp = try allocator.alignedAlloc(u8, .@"4", first.data.len * temporal);
+    defer allocator.free(tmp);
+    var name_buf: [64]u8 = undefined;
+    for (0..temporal) |t| {
+        const slice = if (t == 0) first else mm.tensors.get(std.fmt.bufPrint(&name_buf, "v.patch_embd.weight.{d}", .{t}) catch unreachable) orelse return error.UnsupportedTensor;
+        if (slice.ty != first.ty or !std.mem.eql(u64, &slice.dims, &first.dims)) return error.BadShape;
+        for (0..planes) |p| @memcpy(tmp[(p * temporal + t) * plane ..][0..plane], slice.data[p * plane ..][0..plane]);
+    }
+    const shape = [_]c_int{ @intCast(first.dims[3]), @intCast(first.dims[2]), @intCast(temporal), @intCast(first.dims[1]), @intCast(first.dims[0]) };
+    const dtype: mlx.mlx_dtype = switch (first.ty) {
+        .f32 => .float32,
+        .f16 => .float16,
+        .bf16 => .bfloat16,
+        else => return error.UnsupportedTensor,
+    };
+    return asBf16(mlx.mlx_array_new_data(tmp.ptr, &shape, shape.len, dtype), s);
+}
+
+/// `raw` as bf16, evaluated; consumes `raw`.
+fn asBf16(raw: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (mlx.mlx_array_dtype(raw) == .bfloat16) return raw;
+    defer _ = mlx.mlx_array_free(raw);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_astype(&out, raw, .bfloat16, s));
+    try mlx.check(mlx.mlx_array_eval(out));
+    return out;
 }
 
 /// Runs the decode and the prefill kernel of every distinct (type, shape) in
@@ -235,13 +290,8 @@ fn loadFloat(allocator: std.mem.Allocator, t: gguf.Tensor, transform: arch_mod.T
         },
     };
     // A_log stays f32 like the reference checkpoints, the gate math runs in f32.
-    if (transform == .a_log or transform == .neg_log or dtype == .bfloat16) return raw;
-    defer _ = mlx.mlx_array_free(raw);
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_astype(&out, raw, .bfloat16, s));
-    try mlx.check(mlx.mlx_array_eval(out));
-    return out;
+    if (transform == .a_log or transform == .neg_log) return raw;
+    return asBf16(raw, s);
 }
 
 test "untile moves tiled value-head chunks to grouped order and keeps the prefix" {
@@ -253,6 +303,123 @@ test "untile moves tiled value-head chunks to grouped order and keeps the prefix
     var dst: [src.len]u8 = undefined;
     untile(&dst, src, 2, 2, hp);
     try std.testing.expectEqualStrings("PPa0a1a2b0b1b2", &dst);
+}
+
+test "an mmproj tower loads as bf16 model.visual.* tensors, patch slices stacked on the temporal axis" {
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const Tower = vision.TestTower;
+    const bytes = try (Tower{ .depth = 2 }).write(a);
+    defer a.free(bytes);
+    var f = try gguf.File.parse(a, bytes);
+    defer f.deinit();
+    var map = WeightMap.init(a);
+    defer {
+        var it = map.iterator();
+        while (it.next()) |e| {
+            _ = mlx.mlx_array_free(e.value_ptr.*);
+            a.free(e.key_ptr.*);
+        }
+        map.deinit();
+    }
+    try loadVision(a, &f, &map, s);
+
+    try std.testing.expectEqual(@as(u32, 2 * 12 + 9), map.count());
+    var it = map.iterator();
+    while (it.next()) |e| {
+        try std.testing.expect(std.mem.startsWith(u8, e.key_ptr.*, "model.visual."));
+        try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(e.value_ptr.*));
+    }
+    const h = Tower.hidden;
+    const p = Tower.patch;
+    const shapes = [_]struct { []const u8, []const c_int }{
+        .{ "model.visual.patch_embed.proj.weight", &.{ h, 3, 2, p, p } },
+        .{ "model.visual.patch_embed.proj.bias", &.{h} },
+        .{ "model.visual.pos_embed.weight", &.{ Tower.num_pos, h } },
+        .{ "model.visual.blocks.1.attn.qkv.weight", &.{ 3 * h, h } },
+        .{ "model.visual.blocks.1.attn.qkv.bias", &.{3 * h} },
+        .{ "model.visual.blocks.1.attn.proj.weight", &.{ h, h } },
+        .{ "model.visual.blocks.1.mlp.linear_fc1.weight", &.{ Tower.ffn, h } },
+        .{ "model.visual.blocks.1.mlp.linear_fc2.weight", &.{ h, Tower.ffn } },
+        .{ "model.visual.blocks.1.norm2.bias", &.{h} },
+        .{ "model.visual.merger.norm.weight", &.{h} },
+        .{ "model.visual.merger.linear_fc1.weight", &.{ 4 * h, 4 * h } },
+        .{ "model.visual.merger.linear_fc2.weight", &.{ 6, 4 * h } },
+        .{ "model.visual.merger.linear_fc2.bias", &.{6} },
+    };
+    for (shapes) |sh| try std.testing.expectEqualSlices(c_int, sh[1], mlx.getShape(map.get(sh[0]) orelse return error.TestMissing));
+
+    // HF order [hidden, C, T, kh, kw]: element (o, c, t, y, x) is slice t's (o, c, y, x).
+    var w32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w32);
+    try mlx.check(mlx.mlx_astype(&w32, map.get("model.visual.patch_embed.proj.weight").?, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(w32));
+    const got = (mlx.mlx_array_data_float32(w32) orelse return error.TestNoData)[0 .. h * 3 * 2 * p * p];
+    for (0..h * 3) |oc| for (0..2) |t| for (0..p * p) |yx| {
+        try std.testing.expectEqual(Tower.patchValue(t, oc * p * p + yx), got[(oc * 2 + t) * p * p + yx]);
+    };
+}
+
+test "an mmproj tower is bit-equal to the MLX pack of the same checkpoint (set MLX_SERVE_GGUF_VISION_MMPROJ, MLX_SERVE_GGUF_VISION_ORACLE)" {
+    const mm_path = std.mem.span(std.c.getenv("MLX_SERVE_GGUF_VISION_MMPROJ") orelse return error.SkipZigTest);
+    const oracle = std.c.getenv("MLX_SERVE_GGUF_VISION_ORACLE") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var f = try gguf.File.open(a, mm_path);
+    defer f.deinit();
+    var map = WeightMap.init(a);
+    defer {
+        var it = map.iterator();
+        while (it.next()) |e| {
+            _ = mlx.mlx_array_free(e.value_ptr.*);
+            a.free(e.key_ptr.*);
+        }
+        map.deinit();
+    }
+    try loadVision(a, &f, &map, s);
+
+    var want = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(want);
+    var meta_map = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+    try mlx.check(mlx.mlx_load_safetensors(&want, &meta_map, oracle, cpu));
+    var n_want: u32 = 0;
+    const wit = mlx.mlx_map_string_to_array_iterator_new(want);
+    defer _ = mlx.mlx_map_string_to_array_iterator_free(wit);
+    while (true) {
+        var key: ?[*:0]const u8 = null;
+        var v = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v);
+        if (mlx.mlx_map_string_to_array_iterator_next(&key, &v, wit) != 0 or key == null) break;
+        n_want += 1;
+    }
+    try std.testing.expectEqual(n_want, map.count());
+
+    var differing: usize = 0;
+    var it = map.iterator();
+    while (it.next()) |e| {
+        const key = try a.dupeSentinel(u8, e.key_ptr.*, 0);
+        defer a.free(key);
+        var w = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(w);
+        try mlx.check(mlx.mlx_map_string_to_array_get(&w, want, key));
+        try std.testing.expectEqualSlices(c_int, mlx.getShape(w), mlx.getShape(e.value_ptr.*));
+        try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(w));
+        try mlx.check(mlx.mlx_array_eval(w));
+        try mlx.check(mlx.mlx_array_eval(e.value_ptr.*));
+        const n = mlx.mlx_array_size(w);
+        const got = (mlx.mlx_array_data_bfloat16(e.value_ptr.*) orelse return error.TestNoData)[0..n];
+        const exp = (mlx.mlx_array_data_bfloat16(w) orelse return error.TestNoData)[0..n];
+        if (!std.mem.eql(u16, got, exp)) {
+            std.debug.print("not bit-equal: {s}\n", .{e.key_ptr.*});
+            differing += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), differing);
 }
 
 test "real model loads into a weight map (set MLX_SERVE_GGUF_TEST_MODEL)" {
