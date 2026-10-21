@@ -47,7 +47,7 @@ pub const Hparams = struct {
         if (pos.n_dims != 2 or pos.dims[0] != hp.hidden) return error.BadMetadata;
         if (hp.depth == 0 or hp.heads == 0 or hp.hidden % hp.heads != 0 or hp.merge == 0) return error.BadMetadata;
         // The tower interpolates the table as a square grid of positions.
-        const side = std.math.sqrt(hp.num_pos);
+        const side: u32 = std.math.sqrt(hp.num_pos);
         if (side * side != hp.num_pos) return error.BadMetadata;
         return hp;
     }
@@ -117,9 +117,48 @@ pub fn unsupportedReason(mm: *const gguf.File, llm: *const gguf.File, buf: []u8)
             .f32, .f16, .bf16 => {},
             else => return std.fmt.bufPrint(buf, "tensor type of {s} (the tower is dense)", .{e.key_ptr.*}) catch "tensor type",
         }
+        const want = wantDims(e.key_ptr.*, hp);
+        const t = e.value_ptr.*;
+        if (t.n_dims != want.len or !std.mem.eql(u64, t.dims[0..t.n_dims], want.slice()))
+            return std.fmt.bufPrint(buf, "shape of {s}", .{e.key_ptr.*}) catch "tensor shape";
     }
     if (mm.tensors.count() != hp.tensorCount()) return std.fmt.bufPrint(buf, "{d} tensors, a full tower has {d}", .{ mm.tensors.count(), hp.tensorCount() }) catch "tensor count";
     return null;
+}
+
+const Dims = struct {
+    len: u32,
+    d: [4]u64,
+
+    fn of(dims: []const u64) Dims {
+        var out = Dims{ .len = @intCast(dims.len), .d = @splat(1) };
+        @memcpy(out.d[0..dims.len], dims);
+        return out;
+    }
+
+    fn slice(self: *const Dims) []const u64 {
+        return self.d[0..self.len];
+    }
+};
+
+/// The ggml dims (innermost first) of a tensor `mapTensor` knows, for these hparams.
+fn wantDims(name: []const u8, hp: Hparams) Dims {
+    const h: u64 = hp.hidden;
+    const merged = h * hp.merge * hp.merge;
+    const of = Dims.of;
+    if (std.mem.startsWith(u8, name, "v.patch_embd.weight")) return of(&.{ hp.patch, hp.patch, 3, h });
+    if (std.mem.eql(u8, name, "v.position_embd.weight")) return of(&.{ h, hp.num_pos });
+    if (std.mem.eql(u8, name, "mm.0.weight")) return of(&.{ merged, merged });
+    if (std.mem.eql(u8, name, "mm.0.bias")) return of(&.{merged});
+    if (std.mem.eql(u8, name, "mm.2.weight")) return of(&.{ merged, hp.out_hidden });
+    if (std.mem.eql(u8, name, "mm.2.bias")) return of(&.{hp.out_hidden});
+    // A block linear is [in, out] with an [out] bias; every other vector (norms, the patch bias) is [hidden].
+    const linears = [_]struct { []const u8, u64, u64 }{
+        .{ ".attn_qkv.", h, 3 * h }, .{ ".attn_out.", h, h }, .{ ".ffn_up.", h, hp.ffn }, .{ ".ffn_down.", hp.ffn, h },
+    };
+    for (linears) |l| if (std.mem.indexOf(u8, name, l[0]) != null)
+        return if (std.mem.endsWith(u8, name, ".weight")) of(&.{ l[1], l[2] }) else of(&.{l[2]});
+    return of(&.{h});
 }
 
 /// `"vision_config":{...}` and the four vision token ids: the top-level keys
@@ -287,6 +326,8 @@ pub const TestTower = struct {
     mismatched_slice: bool = false,
     /// Rows of the position table; a tower's grid is its square root.
     positions: u64 = num_pos,
+    /// `mm.2.weight` stored [out, merged]: the right bytes in the wrong dims.
+    transposed_merger: bool = false,
 
     pub const hidden = 4;
     pub const ffn = 8;
@@ -348,7 +389,8 @@ pub const TestTower = struct {
         try tensors.append(ar, .{ .name = "v.post_ln.bias", .dims = try ar.dupe(u64, &.{h}), .ty = .f32, .data = try f32Data(ar, h, 6) });
         try tensors.append(ar, .{ .name = "mm.0.weight", .dims = try ar.dupe(u64, &.{ merged, merged }), .ty = .bf16, .data = try bf16Data(ar, merged * merged) });
         try tensors.append(ar, .{ .name = "mm.0.bias", .dims = try ar.dupe(u64, &.{merged}), .ty = .f32, .data = try f32Data(ar, merged, 7) });
-        try tensors.append(ar, .{ .name = "mm.2.weight", .dims = try ar.dupe(u64, &.{ merged, self.out_hidden }), .ty = .bf16, .data = try bf16Data(ar, merged * self.out_hidden) });
+        const mm2: [2]u64 = if (self.transposed_merger) .{ self.out_hidden, merged } else .{ merged, self.out_hidden };
+        try tensors.append(ar, .{ .name = "mm.2.weight", .dims = try ar.dupe(u64, &mm2), .ty = .bf16, .data = try bf16Data(ar, merged * self.out_hidden) });
         try tensors.append(ar, .{ .name = "mm.2.bias", .dims = try ar.dupe(u64, &.{self.out_hidden}), .ty = .f32, .data = try f32Data(ar, self.out_hidden, 8) });
         if (self.extra_tensor) |name| try tensors.append(ar, .{ .name = name, .dims = try ar.dupe(u64, &.{h}), .ty = .f32, .data = try f32Data(ar, h, 9) });
 
@@ -512,6 +554,8 @@ test "a valid tower pairs with its model; every other file is declined by name" 
         .{ .{}, 8, "projection_dim 6 is not the model's hidden size 8" },
         .{ .{ .mismatched_slice = true }, 6, "metadata (BadMetadata)" },
         .{ .{ .positions = 6 }, 6, "metadata (BadMetadata)" },
+        .{ .{ .positions = 65536 }, 6, null },
+        .{ .{ .transposed_merger = true }, 6, "shape of mm.2.weight" },
     };
     for (cases) |c| {
         var mm_bytes: []u8 = undefined;
