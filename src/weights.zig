@@ -185,7 +185,7 @@ fn loadQuantized(allocator: std.mem.Allocator, t: gguf.Tensor, mapped: arch_mod.
             };
             var name_buf: [160]u8 = undefined;
             const name = try std.fmt.bufPrint(&name_buf, "{s}{s}{s}", .{ mapped.name[0..at], half_name, mapped.name[at + marker.len ..] });
-            try put(allocator, out, name, mlx.mlx_array_new_data(tmp.ptr, &[_]c_int{ @intCast(nv), @intCast(row_bytes) }, 2, .uint8));
+            try put(allocator, out, name, try packedRows(allocator, t.ty, tmp, &[_]c_int{ @intCast(nv), @intCast(row_bytes) }, s));
             try putSentinel(allocator, out, name, .{ .ty = t.ty }, s);
         }
         return;
@@ -196,7 +196,7 @@ fn loadQuantized(allocator: std.mem.Allocator, t: gguf.Tensor, mapped: arch_mod.
         .none => try packedRows(allocator, t.ty, t.data, &shape, s),
         .tiled_input => blk: {
             info.tiled = .{ .nk = @intCast(hp.nk), .r = @intCast(hp.r()) };
-            break :blk mlx.mlx_array_new_data(t.data.ptr, &shape, 2, .uint8);
+            break :blk try packedRows(allocator, t.ty, t.data, &shape, s);
         },
         .untile_rows => |u| blk: {
             // Rows are whole blocks, so moving a row moves its bytes and nothing else.
@@ -515,6 +515,76 @@ test "an mmproj tower is bit-equal to an MLX pack of the same checkpoint (set ML
         }
     }
     try std.testing.expectEqual(@as(usize, 0), differing);
+}
+
+test "weights the loader rearranges are stored split like the rest (tiled input, fused b / a)" {
+    const a = std.testing.allocator;
+    const quants = @import("quants.zig");
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    // Q6_K, 8 blocks per row: 1680 bytes, a multiple of 16, so no row padding tells the layouts apart.
+    const ty = quants.GgmlType.q6_k;
+    const be = comptime ty.blockElems();
+    const bb = comptime ty.blockBytes();
+    const nb = 8;
+    const in = nb * be;
+    const n_rows = 2;
+    const data = @embedFile("fixtures/q6_k.bin");
+    var ref: [4 * 256]f32 = undefined;
+    try quants.dequantize(ty, data[0 .. 4 * bb], &ref);
+    // Block b of row r is fixture block (r + b) % 4.
+    var bytes: [n_rows * nb * bb]u8 = undefined;
+    for (0..n_rows * nb) |i| @memcpy(bytes[i * bb ..][0..bb], data[((i / nb + i % nb) % 4) * bb ..][0..bb]);
+    const t = gguf.Tensor{ .dims = .{ in, n_rows, 1, 1 }, .n_dims = 2, .ty = ty, .data = &bytes };
+    var hp = std.mem.zeroes(qwen35.Hparams);
+    hp.nk = 2;
+    hp.nv = 4;
+
+    var map = WeightMap.init(a);
+    defer {
+        var it = map.iterator();
+        while (it.next()) |e| {
+            _ = mlx.mlx_array_free(e.value_ptr.*);
+            a.free(e.key_ptr.*);
+        }
+        map.deinit();
+    }
+    try loadQuantized(a, t, .{ .name = "out_proj.weight", .transform = .tiled_input }, hp, &map, s);
+    try loadQuantized(a, t, .{ .name = "l.in_proj_ba.weight", .transform = .{ .split_ba = .{ .nk = 1, .r = 1 } } }, hp, &map, s);
+
+    var prng = std.Random.DefaultPrng.init(3);
+    var xv: [in]f32 = undefined;
+    for (&xv) |*v| v.* = prng.random().float(f32) - 0.5;
+    // out_proj gets x grouped [nk, r, d] and reads it tiled [r, nk, d].
+    const d = in / hp.nv;
+    var xt: [in]f32 = undefined;
+    for (0..hp.nk) |k| for (0..hp.r()) |j| @memcpy(xt[(j * hp.nk + k) * d ..][0..d], xv[(k * hp.r() + j) * d ..][0..d]);
+    const x = mlx.mlx_array_new_data(&xv, &[_]c_int{ 1, in }, 2, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const Case = struct { name: []const u8, rows: []const usize, x_seen: *const [in]f32 };
+    for ([_]Case{
+        .{ .name = "out_proj.", .rows = &.{ 0, 1 }, .x_seen = &xt },
+        .{ .name = "l.in_proj_b.", .rows = &.{0}, .x_seen = &xv },
+        .{ .name = "l.in_proj_a.", .rows = &.{1}, .x_seen = &xv },
+    }) |c| {
+        var nbuf: [64]u8 = undefined;
+        const w = map.get(try std.fmt.bufPrint(&nbuf, "{s}weight", .{c.name})).?;
+        const info = kernels.infoOf(w, map.get(try std.fmt.bufPrint(&nbuf, "{s}scales", .{c.name})).?).?;
+        const y = try kernels.linear(info, x, w, s);
+        defer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_array_eval(y));
+        const got = mlx.mlx_array_data_float32(y).?[0..c.rows.len];
+        for (c.rows, got) |row, g| {
+            var want: f32 = 0;
+            var scale: f32 = 0;
+            for (c.x_seen, 0..) |xc, col| {
+                const term = ref[((row + col / be) % 4) * be + col % be] * xc;
+                want += term;
+                scale += @abs(term);
+            }
+            try std.testing.expectApproxEqAbs(want, g, 1e-5 * scale);
+        }
+    }
 }
 
 test "real model loads into a weight map (set MLX_SERVE_GGUF_TEST_MODEL)" {
