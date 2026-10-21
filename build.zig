@@ -70,5 +70,8 @@ pub fn build(b: *std.Build) void {
 fn runTests(b: *std.Build, mod: *std.Build.Module, model: ?[]const u8) *std.Build.Step.Run {
     const run = b.addRunArtifact(b.addTest(.{ .root_module = mod }));
     if (model) |m| run.setEnvironmentVariable("MLX_SERVE_GGUF_TEST_MODEL", m);
+    // The oracles are f32 CPU dot products; on NAX GPUs MLX runs its own f32
+    // GEMM (the dequant + matmul paths) as TF32 unless told otherwise.
+    run.setEnvironmentVariable("MLX_ENABLE_TF32", "0");
     return run;
 }
