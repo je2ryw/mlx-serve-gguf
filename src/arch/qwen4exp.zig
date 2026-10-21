@@ -81,8 +81,10 @@ pub const Hparams = struct {
         return hp;
     }
 
-    fn nHeads(self: Hparams) u32 {
-        return (self.ngram_size - 1) * self.heads_per_ngram;
+    /// N-gram heads, refused when the header's counts overflow.
+    fn nHeads(self: Hparams) !u32 {
+        if (self.ngram_size < 2) return error.BadMetadata;
+        return std.math.mul(u32, self.ngram_size - 1, self.heads_per_ngram) catch error.BadMetadata;
     }
 };
 
@@ -133,17 +135,18 @@ const NgramMeta = struct {
     vocab_sizes: gguf.Array,
 
     fn check(self: NgramMeta, hp: Hparams, table_rows: u64) !void {
-        if (hp.ngram_size < 2 or hp.heads_per_ngram == 0) return error.BadMetadata;
-        const n = hp.nHeads();
+        if (hp.heads_per_ngram == 0) return error.BadMetadata;
+        const n = try hp.nHeads();
         if (!self.multipliers.isInt() or !self.offsets.isInt() or !self.vocab_sizes.isInt()) return error.BadMetadata;
         if (self.multipliers.len != hp.ngram_size or self.offsets.len != n or self.vocab_sizes.len != n) return error.BadMetadata;
         var total: u64 = 0;
         for (0..n) |i| {
             const size = std.math.cast(u64, self.vocab_sizes.int(i)) orelse return error.BadMetadata;
             if (size == 0 or self.offsets.int(i) != std.math.cast(i64, total)) return error.BadMetadata;
-            total += size;
+            total = std.math.add(u64, total, size) catch return error.BadMetadata;
         }
-        if (table_rows != (total + ngram_rows_divisor - 1) / ngram_rows_divisor * ngram_rows_divisor) return error.BadMetadata;
+        const padded = std.math.add(u64, total, ngram_rows_divisor - 1) catch return error.BadMetadata;
+        if (table_rows != padded / ngram_rows_divisor * ngram_rows_divisor) return error.BadMetadata;
     }
 };
 
@@ -235,7 +238,7 @@ pub fn configJson(allocator: std.mem.Allocator, hp: Hparams, table: TableFile) !
         .idx_budget = hp.indexer_budget,
         .ratio = hp.compress_ratio,
         .ple_layer = hp.ple_layer + 1,
-        .ple_dim = hp.nHeads() * hp.ple_head_dim,
+        .ple_dim = std.math.mul(u32, try hp.nHeads(), hp.ple_head_dim) catch return error.BadMetadata,
         .ple_conv = hp.ple_conv_kernel,
         .ngram = hp.ngram_size,
         .hpn = hp.heads_per_ngram,
@@ -439,6 +442,13 @@ test "the n-gram metadata must be the hash mlx-serve derives: one multiplier per
     try std.testing.expectError(error.BadMetadata, bad_offsets.check(hp, 256));
     const short = NgramMeta{ .multipliers = testArray(&mb, &.{3}), .offsets = testArray(&ob, &.{ 0, 101 }), .vocab_sizes = good.vocab_sizes };
     try std.testing.expectError(error.BadMetadata, short.check(hp, 256));
+    // A hand-made header whose sums or head count overflow is refused, not a panic.
+    const huge = std.math.maxInt(i64);
+    const overflow = NgramMeta{ .multipliers = testArray(&mb, &.{ 3, 5 }), .offsets = testArray(&ob, &.{ 0, huge }), .vocab_sizes = testArray(&vb, &.{ huge, huge }) };
+    try std.testing.expectError(error.BadMetadata, overflow.check(hp, 256));
+    hp.heads_per_ngram = 1 << 31;
+    hp.ngram_size = 3;
+    try std.testing.expectError(error.BadMetadata, good.check(hp, 256));
 }
 
 test "configJson carries the native pack's text_config, no MTP and no vision_config" {
