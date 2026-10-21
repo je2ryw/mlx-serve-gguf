@@ -39,9 +39,14 @@ pub fn configJson(allocator: std.mem.Allocator, f: *const gguf.File, mmproj: ?*c
     const cfg = try (try Arch.read(f)).configJson(allocator, f);
     const mm = mmproj orelse return cfg;
     defer allocator.free(cfg);
+    return withTower(allocator, cfg, mm, vision.TokenIds.read(f) orelse return error.MissingMetadata);
+}
+
+/// `cfg` plus the tower's keys under its own `model_type`; an arch config
+/// leaves them out, or the result holds a key twice.
+pub fn withTower(allocator: std.mem.Allocator, cfg: []const u8, mm: *const gguf.File, ids: vision.TokenIds) ![]u8 {
     const parsed = try std.json.parseFromSlice(struct { model_type: []const u8 }, allocator, cfg, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    const ids = vision.TokenIds.read(f) orelse return error.MissingMetadata;
     const fragment = try vision.configFragment(allocator, try vision.Hparams.read(mm), ids, parsed.value.model_type);
     defer allocator.free(fragment);
     // One JSON object: the tower's keys go in before its closing brace.

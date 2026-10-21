@@ -6,6 +6,7 @@
 //! shard and never loads.
 const std = @import("std");
 const gguf = @import("../gguf.zig");
+const vision = @import("../vision.zig");
 const arch = @import("../arch.zig");
 const qwen35 = arch.qwen35;
 const Transform = arch.Transform;
@@ -20,8 +21,6 @@ const prefix = "language_model.model.";
 /// vocab base is the first head size (`Hparams.ngram_base`).
 const ngram_rows_divisor = 128;
 const split_ngram_parts = 128;
-
-pub const VisionTokens = struct { image: u32, video: u32, start: u32, end: u32 };
 
 pub const Hparams = struct {
     base: qwen35.Hparams,
@@ -45,7 +44,7 @@ pub const Hparams = struct {
     /// The n-gram hash's eos (HF's `text_config.eos_token_id`), not the chat terminator.
     ngram_eos: u32,
     bos: u32,
-    vision: VisionTokens,
+    vision: vision.TokenIds,
 
     pub fn read(f: *const gguf.File) !Hparams {
         const base = try qwen35.Hparams.read(f, arch_name);
@@ -66,7 +65,7 @@ pub const Hparams = struct {
             .ple_head_dim = try k.int("embedding_length_per_layer_input"),
             .ngram_eos = try k.int("ple.eos_token_id"),
             .bos = try arch.u32Key(f, "tokenizer.ggml.bos_token_id"),
-            .vision = try visionTokens(f),
+            .vision = vision.TokenIds.read(f) orelse return error.MissingMetadata,
             .table_rows = (f.tensors.get("per_layer_token_embd.weight") orelse return error.MissingMetadata).dims[1],
             .ngram_base = 0,
         };
@@ -112,24 +111,6 @@ fn pleLayer(layers: gguf.Array, n_layers: u32) !u32 {
     return if (layer < n_layers) layer else error.BadMetadata;
 }
 
-fn visionTokens(f: *const gguf.File) !VisionTokens {
-    const names = [_][]const u8{ "<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>" };
-    var ids: [names.len]?u32 = @splat(null);
-    var it = (f.getArray("tokenizer.ggml.tokens") orelse return error.MissingMetadata).strings();
-    var id: u32 = 0;
-    while (it.next()) |tok| : (id += 1) {
-        for (names, &ids) |n, *slot| if (std.mem.eql(u8, tok, n)) {
-            slot.* = id;
-        };
-    }
-    return .{
-        .image = ids[0] orelse return error.MissingMetadata,
-        .video = ids[1] orelse return error.MissingMetadata,
-        .start = ids[2] orelse return error.MissingMetadata,
-        .end = ids[3] orelse return error.MissingMetadata,
-    };
-}
-
 /// The n-gram hash as the GGUF states it: one multiplier per n-gram position,
 /// per-head vocab sizes, their running sums as offsets, the table padded to
 /// `ngram_rows_divisor` rows.
@@ -163,7 +144,8 @@ pub fn tableFile(f: *const gguf.File) !TableFile {
 }
 
 /// The config.json of the native packs, without the MTP head (the GGUF has
-/// none) and the vision tower (the mmproj's), plus where the table is.
+/// none) and the vision keys (`meta.withTower` adds the mmproj's), plus where
+/// the table is.
 pub fn configJson(allocator: std.mem.Allocator, hp: Hparams, table: TableFile) ![]u8 {
     const b = hp.base;
     var out: std.ArrayList(u8) = .empty;
@@ -173,18 +155,12 @@ pub fn configJson(allocator: std.mem.Allocator, hp: Hparams, table: TableFile) !
     , .{ std.json.fmt(table.path, .{}), table.offset, hp.table_rows, hp.ple_head_dim });
     try out.print(allocator,
         \\"architectures":["Qwen4ExpForConditionalGeneration"],"model_type":"qwen4_exp","language_model_only":false,
-        \\"tie_word_embeddings":{[tied]},"image_token_id":{[image]d},"video_token_id":{[video]d},
-        \\"vision_start_token_id":{[vstart]d},"vision_end_token_id":{[vend]d},
-        \\"quantization":{{"group_size":32,"bits":4,"mode":"gguf"}},
+        \\"tie_word_embeddings":{[tied]},"quantization":{{"group_size":32,"bits":4,"mode":"gguf"}},
         \\"text_config":{{"model_type":"qwen4_exp_text","attention_bias":false,"attention_dropout":0.0,"dtype":"bfloat16",
         \\"bos_token_id":{[bos]d},"eos_token_id":{[eos]d},"pad_token_id":null,"hidden_act":"silu","initializer_range":0.02,
         \\"hidden_size":{[hidden]d},"num_hidden_layers":{[n_layers]d},"layer_types":[
     , .{
         .tied = b.tied,
-        .image = hp.vision.image,
-        .video = hp.vision.video,
-        .vstart = hp.vision.start,
-        .vend = hp.vision.end,
         .bos = hp.bos,
         .eos = hp.ngram_eos,
         .hidden = b.hidden,
@@ -459,7 +435,7 @@ test "the n-gram metadata must be the hash mlx-serve derives: one multiplier per
     try std.testing.expectError(error.BadMetadata, good.check(hp, 256));
 }
 
-test "configJson carries the native pack's text_config, no MTP and no vision_config" {
+test "configJson carries the native pack's text_config, no MTP and no vision keys" {
     const json = try configJson(std.testing.allocator, testHparams(), .{ .path = "/m/x-00002-of-00002.gguf", .offset = 192 });
     defer std.testing.allocator.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
@@ -468,11 +444,8 @@ test "configJson carries the native pack's text_config, no MTP and no vision_con
     try std.testing.expectEqualStrings("qwen4_exp", root.get("model_type").?.string);
     try std.testing.expectEqualStrings("Qwen4ExpForConditionalGeneration", root.get("architectures").?.array.items[0].string);
     try std.testing.expectEqualStrings("gguf", root.get("quantization").?.object.get("mode").?.string);
-    try std.testing.expectEqual(@as(i64, 248056), root.get("image_token_id").?.integer);
-    try std.testing.expectEqual(@as(i64, 248057), root.get("video_token_id").?.integer);
-    try std.testing.expectEqual(@as(i64, 248053), root.get("vision_start_token_id").?.integer);
-    try std.testing.expectEqual(@as(i64, 248054), root.get("vision_end_token_id").?.integer);
-    try std.testing.expect(root.get("vision_config") == null);
+    for ([_][]const u8{ "vision_config", "image_token_id", "video_token_id", "vision_start_token_id", "vision_end_token_id" }) |key|
+        try std.testing.expect(root.get(key) == null);
     // mlx-serve reads the n-gram table's IQ4_NL rows in place, off the shard that holds them.
     const table = root.get("ngram_table").?.object;
     try std.testing.expectEqualStrings("/m/x-00002-of-00002.gguf", table.get("file").?.string);
@@ -496,6 +469,25 @@ test "configJson carries the native pack's text_config, no MTP and no vision_con
     try std.testing.expectEqualStrings("linear_attention", tc.get("layer_types").?.array.items[46].string);
     try std.testing.expectEqual(@as(f64, 0.25), tc.get("partial_rotary_factor").?.float);
     try std.testing.expect(tc.get("mtp") == null and tc.get("mtp_num_hidden_layers") == null);
+}
+
+test "configJson leaves the vision keys to the mmproj: with its tower spliced in, every key is there once" {
+    const a = std.testing.allocator;
+    const hp = testHparams();
+    const cfg = try configJson(a, hp, .{ .path = "/m/x-00002-of-00002.gguf", .offset = 192 });
+    defer a.free(cfg);
+    const mm_bytes = try (vision.TestTower{}).write(a);
+    defer a.free(mm_bytes);
+    var mm = try gguf.File.parse(a, mm_bytes);
+    defer mm.deinit();
+    const joined = try @import("../meta.zig").withTower(a, cfg, &mm, hp.vision);
+    defer a.free(joined);
+    // Default options refuse a duplicate key, as mlx-serve's config parse does.
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, joined, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 248056), root.get("image_token_id").?.integer);
+    try std.testing.expectEqualStrings("qwen4_exp", root.get("vision_config").?.object.get("model_type").?.string);
 }
 
 test "metadataTensor: the PLE's id math as int64 vectors under the native names" {
