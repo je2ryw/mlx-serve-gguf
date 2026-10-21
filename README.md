@@ -127,6 +127,7 @@ The Metal source is plain text in `src/metal/` (`blocks.h` has one decoder per b
     zig build test-core   # reader + reference dequant, no MLX, runs anywhere
     zig build test        # everything, kernels run on the GPU
     zig build test -Dmodel=/path/to/model.gguf   # also parses and loads a real file
+    zig build test -Dqwen4exp=<shard 1> -Dnative-pack=<dir>   # Qwen3.8-Flash-Next: small tensors vs its native mlx-serve pack, no weights loaded
 
 CI (`.github/workflows/ci.yml`) runs the core tests on Linux and the GPU tests plus a real 0.8B file on GitHub's Apple Silicon macOS runners, against a fresh mlx-serve checkout.
 
