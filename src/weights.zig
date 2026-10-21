@@ -361,7 +361,7 @@ test "an mmproj tower loads as bf16 model.visual.* tensors, patch slices stacked
     };
 }
 
-test "an mmproj tower is bit-equal to the MLX pack of the same checkpoint (set MLX_SERVE_GGUF_VISION_MMPROJ, MLX_SERVE_GGUF_VISION_ORACLE)" {
+test "an mmproj tower is bit-equal to an MLX pack of the same checkpoint (set MLX_SERVE_GGUF_VISION_MMPROJ, MLX_SERVE_GGUF_VISION_ORACLE)" {
     const mm_path = std.mem.span(std.c.getenv("MLX_SERVE_GGUF_VISION_MMPROJ") orelse return error.SkipZigTest);
     const oracle = std.c.getenv("MLX_SERVE_GGUF_VISION_ORACLE") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -387,6 +387,11 @@ test "an mmproj tower is bit-equal to the MLX pack of the same checkpoint (set M
     var meta_map = mlx.mlx_map_string_to_string_new();
     defer _ = mlx.mlx_map_string_to_string_free(meta_map);
     try mlx.check(mlx.mlx_load_safetensors(&want, &meta_map, oracle, cpu));
+    // Our spelling, or mlx-vlm's (`vision_tower.`, the patch kernel channels-last [hidden, T, kh, kw, C]) inside a whole pack.
+    var probe = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(probe);
+    const ours = "model.visual.";
+    const prefix: []const u8 = if (mlx.mlx_map_string_to_array_get(&probe, want, ours ++ "pos_embed.weight") == 0) ours else "vision_tower.";
     var n_want: u32 = 0;
     const wit = mlx.mlx_map_string_to_array_iterator_new(want);
     defer _ = mlx.mlx_map_string_to_array_iterator_free(wit);
@@ -395,26 +400,40 @@ test "an mmproj tower is bit-equal to the MLX pack of the same checkpoint (set M
         var v = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(v);
         if (mlx.mlx_map_string_to_array_iterator_next(&key, &v, wit) != 0 or key == null) break;
-        n_want += 1;
+        n_want += @intFromBool(std.mem.startsWith(u8, std.mem.span(key.?), prefix));
     }
     try std.testing.expectEqual(n_want, map.count());
 
     var differing: usize = 0;
     var it = map.iterator();
     while (it.next()) |e| {
-        const key = try a.dupeSentinel(u8, e.key_ptr.*, 0);
+        const key = try std.fmt.allocPrintSentinel(a, "{s}{s}", .{ prefix, e.key_ptr.*[ours.len..] }, 0);
         defer a.free(key);
         var w = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(w);
         try mlx.check(mlx.mlx_map_string_to_array_get(&w, want, key));
-        try std.testing.expectEqualSlices(c_int, mlx.getShape(w), mlx.getShape(e.value_ptr.*));
         try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(w));
-        try mlx.check(mlx.mlx_array_eval(w));
-        try mlx.check(mlx.mlx_array_eval(e.value_ptr.*));
-        const n = mlx.mlx_array_size(w);
-        const got = (mlx.mlx_array_data_bfloat16(e.value_ptr.*) orelse return error.TestNoData)[0..n];
-        const exp = (mlx.mlx_array_data_bfloat16(w) orelse return error.TestNoData)[0..n];
-        if (!std.mem.eql(u16, got, exp)) {
+        if (mlx.getShape(w).len == 5 and mlx.getShape(w)[4] == 3) {
+            var t = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_transpose_axes(&t, w, &[_]c_int{ 0, 4, 1, 2, 3 }, 5, cpu));
+            _ = mlx.mlx_array_free(w);
+            w = t;
+        }
+        try std.testing.expectEqualSlices(c_int, mlx.getShape(w), mlx.getShape(e.value_ptr.*));
+        // Bits, not values: both as uint16.
+        var wb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wb);
+        var gb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gb);
+        var eq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eq);
+        try mlx.check(mlx.mlx_view(&wb, w, .uint16, cpu));
+        try mlx.check(mlx.mlx_view(&gb, e.value_ptr.*, .uint16, cpu));
+        try mlx.check(mlx.mlx_array_equal(&eq, wb, gb, false, cpu));
+        try mlx.check(mlx.mlx_array_eval(eq));
+        var same = false;
+        try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+        if (!same) {
             std.debug.print("not bit-equal: {s}\n", .{e.key_ptr.*});
             differing += 1;
         }
