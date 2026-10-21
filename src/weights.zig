@@ -866,7 +866,8 @@ test "real model loads into a weight map (set MLX_SERVE_GGUF_TEST_MODEL)" {
         .nemotron_h => "backbone.",
         else => p,
     };
-    const norm_name = try std.fmt.allocPrint(a, "{s}{s}norm{s}.weight", .{ prefix, if (arch == .lfm2) "embedding_" else "", if (arch == .nemotron_h) "_f" else "" });
+    // qwen4exp's hyper-connection mixer stands in for the final norm.
+    const norm_name = if (arch == .qwen4exp) try a.dupe(u8, p ++ "hyper_connection_mixer.hc_norm.weight") else try std.fmt.allocPrint(a, "{s}{s}norm{s}.weight", .{ prefix, if (arch == .lfm2) "embedding_" else "", if (arch == .nemotron_h) "_f" else "" });
     defer a.free(norm_name);
     try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(map.get(norm_name).?));
     switch (arch) {
