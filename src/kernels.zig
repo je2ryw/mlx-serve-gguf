@@ -22,7 +22,7 @@ pub const Split = struct { head: u32, payload: u32, payload_at: u32 };
 
 pub fn splitLayout(ty: GgmlType) ?Split {
     return switch (ty) {
-        .q4_0, .iq4_nl => .{ .head = 2, .payload = 16, .payload_at = 2 },
+        .q4_0, .iq4_nl, .q2_0 => .{ .head = 2, .payload = 16, .payload_at = 2 },
         .q4_1 => .{ .head = 4, .payload = 16, .payload_at = 4 },
         .q5_0 => .{ .head = 6, .payload = 16, .payload_at = 6 },
         .q5_1 => .{ .head = 8, .payload = 16, .payload_at = 8 },
@@ -88,6 +88,7 @@ fn headerFor(comptime ty: GgmlType) [:0]const u8 {
         .iq3_xxs => &.{ "tables/ksigns_iq2xs", "tables/iq3xxs_grid", "blocks/iq3_xxs" },
         .iq3_s => &.{ "tables/iq3s_grid", "blocks/iq3_s" },
         .iq1_s, .iq1_m => &.{ "tables/iq1s_grid_gpu", "blocks/iq1" },
+        .q2_0 => &.{"blocks/q2_0"},
         else => unreachable,
     };
     comptime var h: [:0]const u8 = @embedFile("metal/blocks/common.h");
@@ -351,7 +352,7 @@ fn kernelFor(comptime kind: Kind, comptime ty: GgmlType) Error!mlx.mlx_fast_meta
 }
 
 /// Every type with a decoder in metal/blocks.h.
-pub const all_types = [_]GgmlType{ .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .mxfp4, .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .iq2_xxs, .iq2_xs, .iq2_s, .iq3_xxs, .iq3_s, .iq4_nl, .iq4_xs, .iq1_s, .iq1_m };
+pub const all_types = [_]GgmlType{ .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .mxfp4, .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .iq2_xxs, .iq2_xs, .iq2_s, .iq3_xxs, .iq3_s, .iq4_nl, .iq4_xs, .iq1_s, .iq1_m, .q2_0 };
 
 fn kernel(kind: Kind, ty: GgmlType) Error!mlx.mlx_fast_metal_kernel {
     inline for (all_types) |t| {
@@ -845,7 +846,7 @@ test "gatherLinear routes every output to its expert, with and without lhs indic
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var prng = std.Random.DefaultPrng.init(5);
-    inline for ([_]GgmlType{ .iq2_xxs, .q5_k, .iq4_nl }) |ty| {
+    inline for ([_]GgmlType{ .iq2_xxs, .q5_k, .iq4_nl, .q2_0 }) |ty| {
         // The 4 fixture blocks as a bank of 2 experts x 2 rows x 1 block.
         const tw = try TestWeight.init(ty);
         defer tw.deinit();
@@ -898,7 +899,7 @@ test "gathered tile path (sorted and unsorted prefill rows, padded tile) equals 
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var prng = std.Random.DefaultPrng.init(29);
-    inline for ([_]GgmlType{ .iq4_nl, .q6_k, .iq2_xxs }) |ty| {
+    inline for ([_]GgmlType{ .iq4_nl, .q6_k, .iq2_xxs, .q2_0 }) |ty| {
         // 4 experts x 32 rows of one block each; expert e's row r is fixture block (r + e) % 4.
         const be = ty.blockElems();
         const bb = ty.blockBytes();
@@ -946,6 +947,66 @@ test "gathered tile path (sorted and unsorted prefill rows, padded tile) equals 
                     }
                 };
             }
+        }
+    }
+}
+
+test "expert banks at Flash-Next's ffn_down_exps shape (640 in, 2560 rows) on every gather path" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(41);
+    inline for ([_]GgmlType{ .q2_0, .iq4_nl }) |ty| {
+        const be = ty.blockElems();
+        const bb = ty.blockBytes();
+        const in = 640;
+        const nb = in / be;
+        const n_exp = 2;
+        const n_rows = 2560;
+        const data = @embedFile("fixtures/" ++ @tagName(ty) ++ ".bin");
+        var ref: [4 * 256]f32 = undefined;
+        try quants.dequantize(ty, data[0 .. 4 * bb], ref[0 .. 4 * be]);
+        // Block b of expert e's row r is fixture block (r + e + b) % 4.
+        const src = try a.alloc(u8, n_exp * n_rows * nb * bb);
+        defer a.free(src);
+        for (0..n_exp) |e| for (0..n_rows) |r| for (0..nb) |b| {
+            @memcpy(src[((e * n_rows + r) * nb + b) * bb ..][0..bb], data[((r + e + b) % 4) * bb ..][0..bb]);
+        };
+        const rb = rowBytes(ty, in);
+        const rows = try a.alloc(u8, n_exp * n_rows * rb);
+        defer a.free(rows);
+        if (isSplit(ty, in)) packRows(ty, in, rows, src) else @memcpy(rows, src);
+        const bank = mlx.mlx_array_new_data(rows.ptr, &[_]c_int{ n_exp, n_rows, @intCast(rb) }, 3, .uint8);
+        defer _ = mlx.mlx_array_free(bank);
+
+        // 4 pairs: a matvec per pair; 20: the gathered tile kernel; 50: the materialized bank.
+        inline for ([_]usize{ 4, 20, 50 }) |m| {
+            var ids: [m]u32 = undefined;
+            for (&ids, 0..) |*id, i| id.* = @intCast(i * n_exp / m);
+            const xv = try a.alloc(f32, m * in);
+            defer a.free(xv);
+            for (xv) |*v| v.* = prng.random().float(f32) - 0.5;
+            const x = mlx.mlx_array_new_data(xv.ptr, &[_]c_int{ m, 1, in }, 3, .float32);
+            defer _ = mlx.mlx_array_free(x);
+            const rhs = mlx.mlx_array_new_data(&ids, &[_]c_int{m}, 1, .uint32);
+            defer _ = mlx.mlx_array_free(rhs);
+            const y = try gatherLinear(.{ .ty = ty }, x, bank, .{ .ctx = null }, rhs, s);
+            defer _ = mlx.mlx_array_free(y);
+            try std.testing.expectEqualSlices(c_int, &.{ m, 1, n_rows }, mlx.getShape(y));
+            const got = try readF32(y, m * n_rows);
+            for (ids, 0..) |e, t| for (0..n_rows) |r| {
+                var want: f32 = 0;
+                var scale: f32 = 0;
+                for (0..nb) |b| for (0..be) |j| {
+                    const term = xv[t * in + b * be + j] * ref[((r + e + b) % 4) * be + j];
+                    want += term;
+                    scale += @abs(term);
+                };
+                if (@abs(want - got[t * n_rows + r]) > 1e-5 * scale) {
+                    std.debug.print("{s} m={d} pair {d} expert {d} row {d}: got {d} want {d}\n", .{ @tagName(ty), m, t, e, r, got[t * n_rows + r], want });
+                    return error.TestUnexpectedResult;
+                }
+            };
         }
     }
 }

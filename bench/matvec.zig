@@ -38,6 +38,8 @@ const shapes = [_]Shape{
     .{ .name = "moe down    512->2048 x256", .in = 512, .out = 2048, .experts = 256 },
     // gpt-oss-20b experts: 32 of them, 4 per token (the bench routes 8).
     .{ .name = "gptoss experts 2880->2880 x32", .in = 2880, .out = 2880, .experts = 32 },
+    // Qwen3.8-Flash-Next experts: 512 of them, 10 per token (the bench routes 8).
+    .{ .name = "flashnext down 640->2560 x512", .in = 640, .out = 2560, .experts = 512 },
 };
 const types = kernels.all_types;
 

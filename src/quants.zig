@@ -29,6 +29,7 @@ pub const GgmlType = enum(u32) {
     iq1_m = 29,
     bf16 = 30,
     mxfp4 = 39,
+    q2_0 = 42,
     _,
 
     pub fn supported(self: GgmlType) bool {
@@ -40,6 +41,7 @@ pub const GgmlType = enum(u32) {
         return switch (self) {
             .f32, .f16, .bf16 => 1,
             .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .iq4_nl, .mxfp4 => 32,
+            .q2_0 => 64,
             .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .iq2_s, .iq4_xs, .iq1_s, .iq1_m => 256,
             _ => 0,
         };
@@ -50,7 +52,7 @@ pub const GgmlType = enum(u32) {
         return switch (self) {
             .f32 => 4,
             .f16, .bf16 => 2,
-            .q4_0 => 18,
+            .q4_0, .q2_0 => 18,
             .q4_1 => 20,
             .q5_0 => 22,
             .q5_1 => 24,
@@ -121,6 +123,7 @@ pub fn dequantize(ty: GgmlType, src: []const u8, dst: []f32) Error!void {
             .iq1_s => iq1S(blk, y),
             .iq1_m => iq1M(blk, y),
             .mxfp4 => mxfp4(blk, y),
+            .q2_0 => q2_0(blk, y),
             else => unreachable,
         }
     }
@@ -173,6 +176,14 @@ fn mxfp4(b: []const u8, y: []f32) void {
     for (b[1..17], 0..) |q, j| {
         y[j] = int(kvalues_fp4[q & 0xF]) * d;
         y[j + 16] = int(kvalues_fp4[q >> 4]) * d;
+    }
+}
+
+/// Q2_0: one f16 scale per 64 weights, weight j in bits 2 * (j % 4) of byte j / 4, y = (q - 1) * d.
+fn q2_0(b: []const u8, y: []f32) void {
+    const d = half(b, 0);
+    for (b[2..18], 0..) |q, i| {
+        for (0..4) |k| y[4 * i + k] = (int((q >> @intCast(2 * k)) & 3) - 1) * d;
     }
 }
 
@@ -470,6 +481,7 @@ test "dequant matches ggml for every supported type" {
     try expectMatchesGgml(.iq1_s, "iq1_s.bin");
     try expectMatchesGgml(.iq1_m, "iq1_m.bin");
     try expectMatchesGgml(.mxfp4, "mxfp4.bin");
+    try expectMatchesGgml(.q2_0, "q2_0.bin");
 }
 
 test "dequantize rejects a short buffer and unknown types" {

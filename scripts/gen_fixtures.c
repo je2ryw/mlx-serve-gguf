@@ -13,7 +13,7 @@ typedef void (*dequant_fn)(const void *x, float *y, int64_t k);
 
 #define DECL(name) void dequantize_row_##name(const void *x, float *y, int64_t k);
 DECL(q4_0) DECL(q4_1) DECL(q5_0) DECL(q5_1) DECL(q8_0) DECL(mxfp4) DECL(q2_K) DECL(q3_K) DECL(q4_K) DECL(q5_K) DECL(q6_K)
-DECL(iq2_xxs) DECL(iq2_xs) DECL(iq2_s) DECL(iq3_xxs) DECL(iq3_s) DECL(iq4_nl) DECL(iq4_xs) DECL(iq1_s) DECL(iq1_m)
+DECL(iq2_xxs) DECL(iq2_xs) DECL(iq2_s) DECL(iq3_xxs) DECL(iq3_s) DECL(iq4_nl) DECL(iq4_xs) DECL(iq1_s) DECL(iq1_m) DECL(q2_0)
 
 struct spec {
     const char *name;
@@ -30,6 +30,8 @@ static const struct spec specs[] = {
     S(iq2_xxs, 66, 256, 0, -1),  S(iq2_s, 82, 256, 0, -1),    S(iq3_xxs, 98, 256, 0, -1),
     S(iq3_s, 110, 256, 0, -1),   S(iq4_nl, 18, 32, 0, -1),    S(iq4_xs, 136, 256, 0, -1),
     S(iq2_xs, 74, 256, 0, -1),   S(iq1_s, 50, 256, 0, -1),    S(iq1_m, 56, 256, -1, -1),
+    // New types go last: the shared rand() stream keeps every older fixture's bytes.
+    S(q2_0, 18, 64, 0, -1),
 };
 
 int main(int argc, char **argv) {
