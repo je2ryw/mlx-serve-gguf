@@ -5,6 +5,7 @@ const core = @import("core.zig");
 pub const gguf = core.gguf;
 pub const quants = core.quants;
 pub const meta = core.meta;
+pub const vision = core.vision;
 pub const kernels = @import("kernels.zig");
 pub const weights = @import("weights.zig");
 

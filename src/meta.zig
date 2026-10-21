@@ -4,6 +4,7 @@
 const std = @import("std");
 const gguf = @import("gguf.zig");
 const Arch = @import("arch.zig").Arch;
+const vision = @import("vision.zig");
 
 pub const Error = error{ UnsupportedArch, UnsupportedTokenizer, UnsupportedTensor, MissingMetadata, BadMetadata } || std.mem.Allocator.Error;
 
@@ -24,8 +25,21 @@ pub fn unsupportedReason(f: *const gguf.File, buf: []u8) ?[]const u8 {
     return null;
 }
 
-pub fn configJson(allocator: std.mem.Allocator, f: *const gguf.File) ![]u8 {
-    return (try Arch.read(f)).configJson(allocator);
+/// With `mmproj` (a tower `vision.unsupportedReason` accepts for this model) the
+/// config also carries its `vision_config` and the vision token ids, as an HF
+/// checkpoint of the same model does; the arch modules never see the tower.
+pub fn configJson(allocator: std.mem.Allocator, f: *const gguf.File, mmproj: ?*const gguf.File) ![]u8 {
+    const cfg = try (try Arch.read(f)).configJson(allocator);
+    const mm = mmproj orelse return cfg;
+    defer allocator.free(cfg);
+    const parsed = try std.json.parseFromSlice(struct { model_type: []const u8 }, allocator, cfg, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const ids = vision.TokenIds.read(f) orelse return error.MissingMetadata;
+    const fragment = try vision.configFragment(allocator, try vision.Hparams.read(mm), ids, parsed.value.model_type);
+    defer allocator.free(fragment);
+    // One JSON object: the tower's keys go in before its closing brace.
+    if (cfg.len == 0 or cfg[cfg.len - 1] != '}') return error.BadMetadata;
+    return std.mem.concat(allocator, u8, &.{ cfg[0 .. cfg.len - 1], ",", fragment, "}" });
 }
 
 /// The tokenizer.json blocks around the BPE vocab, by llama.cpp tokenizer
@@ -321,6 +335,35 @@ fn appendJsonString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []
     try out.append(allocator, '"');
 }
 
+test "configJson carries an mmproj's vision_config under the model's own model_type" {
+    const a = std.testing.allocator;
+    const llm_bytes = try vision.writeTestLlm(a, 6);
+    defer a.free(llm_bytes);
+    const mm_bytes = try (vision.TestTower{}).write(a);
+    defer a.free(mm_bytes);
+    var llm = try gguf.File.parse(a, llm_bytes);
+    defer llm.deinit();
+    var mm = try gguf.File.parse(a, mm_bytes);
+    defer mm.deinit();
+
+    const with = try configJson(a, &llm, &mm);
+    defer a.free(with);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, with, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("qwen3_5", root.get("model_type").?.string);
+    try std.testing.expectEqualStrings("qwen3_5", root.get("vision_config").?.object.get("model_type").?.string);
+    try std.testing.expectEqual(@as(i64, 5), root.get("image_token_id").?.integer);
+    try std.testing.expectEqual(@as(i64, 6), root.get("text_config").?.object.get("hidden_size").?.integer);
+
+    const without = try configJson(a, &llm, null);
+    defer a.free(without);
+    const plain = try std.json.parseFromSlice(std.json.Value, a, without, .{});
+    defer plain.deinit();
+    try std.testing.expect(plain.value.object.get("vision_config") == null);
+    try std.testing.expect(plain.value.object.get("image_token_id") == null);
+}
+
 test "appendJsonString round-trips through the JSON parser" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(std.testing.allocator);
@@ -339,7 +382,7 @@ test "real model: synthesized JSON parses and matches the GGUF (set MLX_SERVE_GG
     var buf: [200]u8 = undefined;
     try std.testing.expectEqual(@as(?[]const u8, null), unsupportedReason(&f, &buf));
 
-    const cfg = try configJson(a, &f);
+    const cfg = try configJson(a, &f, null);
     defer a.free(cfg);
     const cfg_parsed = try std.json.parseFromSlice(std.json.Value, a, cfg, .{});
     defer cfg_parsed.deinit();
