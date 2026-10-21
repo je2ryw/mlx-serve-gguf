@@ -210,7 +210,7 @@ pub const File = struct {
     fn openSiblings(self: *File, path: []const u8) !void {
         const count = self.getInt("split.count") orelse return;
         if (count <= 1) return;
-        if (self.getInt("split.no") != 0) return error.SplitNotFirstShard;
+        if ((self.getInt("split.no") orelse return error.BadSplit) != 0) return error.SplitNotFirstShard;
         const n = std.math.cast(usize, count) orelse return error.BadSplit;
         const a = self.arena.allocator();
         const suffix = try std.fmt.allocPrint(a, "-00001-of-{d:0>5}.gguf", .{n});
@@ -395,7 +395,8 @@ test "parse rejects a file cut short anywhere" {
 }
 
 const TestShard = struct {
-    no: u16,
+    /// null: no split.no key.
+    no: ?u16,
     count: u16,
     total: i32,
     /// Q8_0 [32 x 2] tensors, every data byte = `fill`.
@@ -408,15 +409,18 @@ fn buildShard(w: *TestWriter, sh: TestShard) !void {
     try w.buf.appendSlice(w.a, "GGUF");
     try w.num(@as(u32, 3));
     try w.num(@as(u64, sh.tensors.len));
-    try w.num(@as(u64, if (sh.no == 0) 4 else 3));
-    if (sh.no == 0) {
+    const first = (sh.no orelse 0) == 0;
+    try w.num(@as(u64, 2) + @intFromBool(first) + @intFromBool(sh.no != null));
+    if (first) {
         try w.str("general.architecture");
         try w.num(@as(u32, 8));
         try w.str("qwen35");
     }
-    try w.str("split.no");
-    try w.num(@as(u32, 2));
-    try w.num(sh.no);
+    if (sh.no) |no| {
+        try w.str("split.no");
+        try w.num(@as(u32, 2));
+        try w.num(no);
+    }
     try w.str("split.count");
     try w.num(@as(u32, 2));
     try w.num(sh.count);
@@ -502,6 +506,8 @@ test "a split set that does not add up is refused" {
         .{ .names = &shard_names, .shards = &.{ a1[0], .{ .no = 1, .count = 2, .total = 2, .tensors = &.{.{ .name = "a.weight", .fill = 2 }} } }, .want = error.BadSplit },
         // split.count > 1 on a file not named like a shard
         .{ .names = &.{"m.gguf"}, .shards = &a1, .want = error.BadSplit },
+        // split.count > 1 without split.no
+        .{ .names = shard_names[0..1], .shards = &.{.{ .no = null, .count = 2, .total = 1, .tensors = &.{.{ .name = "a.weight", .fill = 1 }} }}, .want = error.BadSplit },
     };
     for (cases) |c| {
         var tmp = std.testing.tmpDir(.{});
