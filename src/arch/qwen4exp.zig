@@ -165,9 +165,7 @@ pub fn configJson(allocator: std.mem.Allocator, hp: Hparams, table: TableFile) !
         \\{{"ngram_table":{{"file":{f},"format":"gguf_iq4_nl","offset":{d},"rows":{d},"dim":{d}}},
     , .{ std.json.fmt(table.path, .{}), table.offset, hp.table_rows, hp.ple_head_dim });
     try out.print(allocator,
-        // Norms stored folded (1 + w) like the native packs: weights.zig's "small float tensors ... native pack's bf16" test.
         \\"architectures":["Qwen4ExpForConditionalGeneration"],"model_type":"qwen4_exp","language_model_only":false,
-        \\"qwen4_norm_convention":"folded",
         \\"tie_word_embeddings":{[tied]},"image_token_id":{[image]d},"video_token_id":{[video]d},
         \\"vision_start_token_id":{[vstart]d},"vision_end_token_id":{[vend]d},
         \\"quantization":{{"group_size":32,"bits":4,"mode":"gguf"}},
@@ -464,7 +462,8 @@ test "configJson carries the native pack's text_config, no MTP and no vision_con
     try std.testing.expectEqual(@as(i64, 192), table.get("offset").?.integer);
     try std.testing.expectEqual(@as(i64, 320001536), table.get("rows").?.integer);
     try std.testing.expectEqual(@as(i64, 160), table.get("dim").?.integer);
-    try std.testing.expectEqualStrings("folded", root.get("qwen4_norm_convention").?.string);
+    // The GGUF path uses norms as stored (folded, weights.zig's layout oracle): no marker.
+    try std.testing.expect(root.get("qwen4_norm_convention") == null);
     const tc = root.get("text_config").?.object;
     try std.testing.expectEqualStrings("qwen4_exp_text", tc.get("model_type").?.string);
     // The n-gram hash's eos, not the chat terminator.
