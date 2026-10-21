@@ -37,6 +37,35 @@ pub fn load(allocator: std.mem.Allocator, f: *const gguf.File, out: *WeightMap, 
     }
 }
 
+/// The bytes `load` puts on the GPU, over every shard: a tensor `mapTensor`
+/// skips (an MTP block, Qwen3.8-Flash-Next's n-gram table) is not loaded.
+pub fn residentBytes(f: *const gguf.File) !u64 {
+    return residentBytesOf(try Arch.read(f), f);
+}
+
+fn residentBytesOf(arch: Arch, f: *const gguf.File) u64 {
+    var name_buf: [160]u8 = undefined;
+    var total: u64 = 0;
+    var it = f.tensors.iterator();
+    while (it.next()) |e| {
+        const mapped = arch.mapTensor(&name_buf, e.key_ptr.*) orelse continue;
+        if (mapped.name.len == 0) continue;
+        const t = e.value_ptr.*;
+        if (t.ty.isQuantized()) {
+            const in: usize = @intCast(t.dims[0]);
+            total += t.elems() / in * kernels.rowBytes(t.ty, in);
+        } else {
+            // Floats load as bf16, A_log stays f32.
+            total += t.elems() * @as(u64, if (mapped.transform == .a_log or mapped.transform == .neg_log) 4 else 2);
+        }
+    }
+    var i: usize = 0;
+    while (arch.metadataTensor(&name_buf, i)) |m| : (i += 1) {
+        if (f.getArray(m.key)) |arr| total += 8 * arr.len;
+    }
+    return total;
+}
+
 fn loadTensor(allocator: std.mem.Allocator, t: gguf.Tensor, mapped: arch_mod.Mapped, hp: qwen35.Hparams, out: *WeightMap, s: mlx.mlx_stream) !void {
     if (t.ty.isQuantized()) return loadQuantized(allocator, t, mapped, hp, out, s);
     try put(allocator, out, mapped.name, try loadFloat(allocator, t, mapped.transform, hp, s));
@@ -656,6 +685,28 @@ test "weights the loader rearranges are stored split like the rest (tiled input,
             try std.testing.expectApproxEqAbs(want, g, 1e-5 * scale);
         }
     }
+}
+
+test "residentBytes bills every shard's loaded tensors as stored: split rows padded, floats as bf16, a skipped one out" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try gguf.writeShards(tmp, &gguf.shard_names, &.{
+        .{ .no = 0, .count = 2, .total = 4, .tensors = &.{ .{ .name = "token_embd.weight", .fill = 1 }, .{ .name = "blk.0.attn_norm.weight", .fill = 0, .ty = .f32 } } },
+        // A loaded tensor on the second shard, and the MTP block qwen35's map skips.
+        .{ .no = 1, .count = 2, .total = 4, .tensors = &.{ .{ .name = "blk.0.ffn_down.weight", .fill = 2 }, .{ .name = "blk.1.nextn.eh_proj.weight", .fill = 3 } } },
+    }, &buf);
+    const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, gguf.shard_names[0] });
+    defer a.free(path);
+    var f = try gguf.File.open(a, path);
+    defer f.deinit();
+    var hp = std.mem.zeroes(qwen35.Hparams);
+    hp.n_layers = 1;
+    hp.nk = 1;
+    hp.nv = 1;
+    // Two Q8_0 [32 x 2] weights at their padded split rows, and the f32 [32 x 2] norm as bf16.
+    try std.testing.expectEqual(@as(u64, 2 * 2 * kernels.rowBytes(.q8_0, 32) + 64 * 2), residentBytesOf(.{ .qwen35 = hp }, &f));
 }
 
 test "fused rows are joined in part order, whichever part the file lists first" {

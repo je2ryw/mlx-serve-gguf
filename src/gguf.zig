@@ -402,13 +402,24 @@ test "parse rejects a file cut short anywhere" {
     }
 }
 
-const TestShard = struct {
+/// Test helper: a [32 x 2] tensor whose every data byte is `fill`.
+pub const TestTensor = struct {
+    name: []const u8,
+    fill: u8,
+    ty: GgmlType = .q8_0,
+
+    fn bytes(self: TestTensor) usize {
+        return 64 / self.ty.blockElems() * self.ty.blockBytes();
+    }
+};
+
+/// Test helper: one shard of a split GGUF.
+pub const TestShard = struct {
     /// null: no split.no key.
     no: ?u16,
     count: u16,
     total: i32,
-    /// Q8_0 [32 x 2] tensors, every data byte = `fill`.
-    tensors: []const struct { name: []const u8, fill: u8 },
+    tensors: []const TestTensor,
 };
 
 /// One shard of a split GGUF as llama.cpp writes it: the first shard carries
@@ -435,22 +446,24 @@ fn buildShard(w: *TestWriter, sh: TestShard) !void {
     try w.str("split.tensors.count");
     try w.num(@as(u32, 5));
     try w.num(sh.total);
-    for (sh.tensors, 0..) |t, i| {
+    var offset: u64 = 0;
+    for (sh.tensors) |t| {
         try w.str(t.name);
         try w.num(@as(u32, 2));
         try w.num(@as(u64, 32));
         try w.num(@as(u64, 2));
-        try w.num(@as(u32, 8));
-        try w.num(@as(u64, 96 * i));
+        try w.num(@backingInt(t.ty));
+        try w.num(offset);
+        offset += (t.bytes() + 31) / 32 * 32;
     }
     for (sh.tensors) |t| {
         while (w.buf.items.len % 32 != 0) try w.buf.append(w.a, 0);
-        try w.buf.appendNTimes(w.a, t.fill, 68);
+        try w.buf.appendNTimes(w.a, t.fill, t.bytes());
     }
 }
 
-/// Writes `shards` as `<dir>/<names[i]>`, returns the directory's absolute path.
-fn writeShards(dir: std.testing.TmpDir, names: []const []const u8, shards: []const TestShard, path_buf: []u8) ![]const u8 {
+/// Test helper: writes `shards` as `<dir>/<names[i]>`, returns the directory's absolute path.
+pub fn writeShards(dir: std.testing.TmpDir, names: []const []const u8, shards: []const TestShard, path_buf: []u8) ![]const u8 {
     const io = std.testing.io;
     for (names, shards) |name, sh| {
         var w = TestWriter{};
@@ -461,7 +474,7 @@ fn writeShards(dir: std.testing.TmpDir, names: []const []const u8, shards: []con
     return path_buf[0..try dir.dir.realPath(io, path_buf)];
 }
 
-const shard_names = [_][]const u8{ "m-00001-of-00002.gguf", "m-00002-of-00002.gguf" };
+pub const shard_names = [_][]const u8{ "m-00001-of-00002.gguf", "m-00002-of-00002.gguf" };
 
 test "a split GGUF opens from its first shard as one tensor table over every shard" {
     var tmp = std.testing.tmpDir(.{});
