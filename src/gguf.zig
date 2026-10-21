@@ -56,6 +56,14 @@ pub const Array = struct {
         };
     }
 
+    /// Whether `int` reads every element.
+    pub fn isInt(self: Array) bool {
+        return switch (self.elem_type) {
+            .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64 => true,
+            else => false,
+        };
+    }
+
     /// Scalar element as i64 (token types, eos id lists, ...).
     pub fn int(self: Array, i: usize) i64 {
         const sz = scalarSize(self.elem_type).?;

@@ -10,6 +10,7 @@ pub const lfm2 = @import("arch/lfm2.zig");
 pub const gpt_oss = @import("arch/gpt_oss.zig");
 pub const nemotron_h = @import("arch/nemotron_h.zig");
 pub const qwen3next = @import("arch/qwen3next.zig");
+pub const qwen4exp = @import("arch/qwen4exp.zig");
 
 /// What loading has to do to a tensor's bytes. Most of them undo llama.cpp's
 /// value-head tiling of the GatedDeltaNet, see arch/qwen35.zig.
@@ -40,9 +41,14 @@ pub const Transform = union(enum) {
     /// Quantized [2 * nk * r, in] with rows [b heads of key head 0, a heads of key head 0, b of 1, ...]:
     /// split into `in_proj_b` and `in_proj_a` of [nk * r, in] (Qwen3-Next's fused b / a projection).
     split_ba: struct { nk: u32, r: u32 },
+    /// Rows of a tensor HF stores fused with others: part `part` of `parts`, joined in part order.
+    join_rows: struct { part: u8, parts: u8 },
 };
 
 pub const Mapped = struct { name: []const u8, transform: Transform };
+
+/// An int64 vector HF checkpoints carry as a tensor and the GGUF as the metadata array `key`.
+pub const MetadataTensor = struct { name: []const u8, key: []const u8 };
 
 pub const Arch = union(enum) {
     qwen35: qwen35.Hparams,
@@ -52,6 +58,7 @@ pub const Arch = union(enum) {
     gpt_oss: gpt_oss.Hparams,
     nemotron_h: nemotron_h.Hparams,
     qwen3next: qwen3next.Hparams,
+    qwen4exp: qwen4exp.Hparams,
 
     /// error.UnsupportedArch for anything not in the table.
     pub fn read(f: *const gguf.File) !Arch {
@@ -63,6 +70,7 @@ pub const Arch = union(enum) {
         if (std.mem.eql(u8, name, gpt_oss.arch_name)) return .{ .gpt_oss = try gpt_oss.Hparams.read(f) };
         if (nemotron_h.handles(name)) return .{ .nemotron_h = try nemotron_h.Hparams.read(f, name) };
         if (std.mem.eql(u8, name, qwen3next.arch_name)) return .{ .qwen3next = try qwen3next.Hparams.read(f) };
+        if (std.mem.eql(u8, name, qwen4exp.arch_name)) return .{ .qwen4exp = try qwen4exp.Hparams.read(f) };
         return error.UnsupportedArch;
     }
 
@@ -76,6 +84,7 @@ pub const Arch = union(enum) {
             .gpt_oss => |hp| gpt_oss.configJson(allocator, hp),
             .nemotron_h => |hp| nemotron_h.configJson(allocator, hp),
             .qwen3next => |hp| qwen3next.configJson(allocator, hp),
+            .qwen4exp => |hp| qwen4exp.configJson(allocator, hp),
         };
     }
 
@@ -90,6 +99,24 @@ pub const Arch = union(enum) {
             .gpt_oss => |hp| gpt_oss.mapTensor(buf, name, hp),
             .nemotron_h => |hp| nemotron_h.mapTensor(buf, name, hp),
             .qwen3next => |hp| qwen3next.mapTensor(buf, name, hp),
+            .qwen4exp => |hp| qwen4exp.mapTensor(buf, name, hp),
+        };
+    }
+
+    /// The GatedDeltaNet geometry the un-tiling transforms read (zeroes where no map yields them).
+    pub fn gdn(self: Arch) qwen35.Hparams {
+        return switch (self) {
+            .qwen35 => |hp| hp,
+            .qwen4exp => |hp| hp.base,
+            else => std.mem.zeroes(qwen35.Hparams),
+        };
+    }
+
+    /// Tensor `i` of those built from metadata, null past the last.
+    pub fn metadataTensor(self: Arch, buf: []u8, i: usize) ?MetadataTensor {
+        return switch (self) {
+            .qwen4exp => |hp| qwen4exp.metadataTensor(buf, i, hp),
+            else => null,
         };
     }
 };
@@ -119,4 +146,5 @@ test {
     _ = gpt_oss;
     _ = nemotron_h;
     _ = qwen3next;
+    _ = qwen4exp;
 }

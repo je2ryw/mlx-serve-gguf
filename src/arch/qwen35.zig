@@ -91,7 +91,7 @@ pub const Hparams = struct {
 };
 
 /// Metadata lookups under "<arch_name>.".
-const Keys = struct {
+pub const Keys = struct {
     f: *const gguf.File,
     arch_name: []const u8,
 
@@ -99,17 +99,17 @@ const Keys = struct {
         return std.fmt.bufPrint(buf, "{s}.{s}", .{ self.arch_name, suffix }) catch unreachable;
     }
 
-    fn int(self: Keys, suffix: []const u8) !u32 {
+    pub fn int(self: Keys, suffix: []const u8) !u32 {
         var buf: [96]u8 = undefined;
         return arch.u32Key(self.f, self.key(&buf, suffix));
     }
 
-    fn float(self: Keys, suffix: []const u8) !f64 {
+    pub fn float(self: Keys, suffix: []const u8) !f64 {
         var buf: [96]u8 = undefined;
         return self.f.getFloat(self.key(&buf, suffix)) orelse error.MissingMetadata;
     }
 
-    fn array(self: Keys, suffix: []const u8) ?gguf.Array {
+    pub fn array(self: Keys, suffix: []const u8) ?gguf.Array {
         var buf: [96]u8 = undefined;
         return self.f.getArray(self.key(&buf, suffix));
     }

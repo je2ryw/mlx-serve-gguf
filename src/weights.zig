@@ -15,20 +15,91 @@ pub const WeightMap = std.StringHashMap(mlx.mlx_array);
 /// Fills `out` (keys owned by `allocator`, the contract of mlx-serve's Weights).
 pub fn load(allocator: std.mem.Allocator, f: *const gguf.File, out: *WeightMap, s: mlx.mlx_stream) !void {
     const arch = try Arch.read(f);
-    // Only the qwen35 map yields un-tiling transforms, the rest never look at this.
-    const hp = if (arch == .qwen35) arch.qwen35 else std.mem.zeroes(qwen35.Hparams);
+    const hp = arch.gdn();
+    var joins = Joins{ .allocator = allocator };
+    defer joins.deinit();
     var name_buf: [160]u8 = undefined;
     var it = f.tensors.iterator();
     while (it.next()) |e| {
         const mapped = arch.mapTensor(&name_buf, e.key_ptr.*) orelse return error.UnsupportedTensor;
         if (mapped.name.len == 0) continue;
         const t = e.value_ptr.*;
-        if (t.ty.isQuantized()) {
-            try loadQuantized(allocator, t, mapped, hp, out, s);
-        } else {
-            try put(allocator, out, mapped.name, try loadFloat(allocator, t, mapped.transform, hp, s));
-        }
+        if (mapped.transform == .join_rows) {
+            const joined = try joins.add(mapped.name, mapped.transform.join_rows, t) orelse continue;
+            defer allocator.free(joined.data);
+            try loadTensor(allocator, joined, .{ .name = mapped.name, .transform = .none }, hp, out, s);
+        } else try loadTensor(allocator, t, mapped, hp, out, s);
     }
+    if (joins.pending() > 0) return error.UnsupportedTensor;
+    var i: usize = 0;
+    while (arch.metadataTensor(&name_buf, i)) |m| : (i += 1) {
+        try put(allocator, out, m.name, try int64Vector(f.getArray(m.key) orelse return error.MissingMetadata));
+    }
+}
+
+fn loadTensor(allocator: std.mem.Allocator, t: gguf.Tensor, mapped: arch_mod.Mapped, hp: qwen35.Hparams, out: *WeightMap, s: mlx.mlx_stream) !void {
+    if (t.ty.isQuantized()) return loadQuantized(allocator, t, mapped, hp, out, s);
+    try put(allocator, out, mapped.name, try loadFloat(allocator, t, mapped.transform, hp, s));
+}
+
+const max_join_parts = 4;
+
+/// Tensors HF stores fused (`join_rows`), held until every part has been seen.
+const Joins = struct {
+    allocator: std.mem.Allocator,
+    parts: std.StringHashMapUnmanaged([max_join_parts]?gguf.Tensor) = .empty,
+
+    /// The joined [in, rows] tensor once `t` completes `name` (caller frees its data), else null.
+    fn add(self: *Joins, name: []const u8, at: @FieldType(arch_mod.Transform, "join_rows"), t: gguf.Tensor) !?gguf.Tensor {
+        if (at.part >= at.parts or at.parts > max_join_parts or t.n_dims != 2) return error.UnsupportedTensor;
+        const gop = try self.parts.getOrPut(self.allocator, name);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, name) catch |err| {
+                self.parts.removeByPtr(gop.key_ptr);
+                return err;
+            };
+            gop.value_ptr.* = @splat(null);
+        }
+        const slots = gop.value_ptr[0..at.parts];
+        if (slots[at.part] != null) return error.UnsupportedTensor;
+        for (slots) |p| if (p) |other| if (other.ty != t.ty or other.dims[0] != t.dims[0]) return error.BadShape;
+        slots[at.part] = t;
+        var rows: u64 = 0;
+        var bytes: usize = 0;
+        for (slots) |p| {
+            rows += (p orelse return null).dims[1];
+            bytes += p.?.data.len;
+        }
+        const data = try self.allocator.alloc(u8, bytes);
+        var at_byte: usize = 0;
+        for (slots) |p| {
+            @memcpy(data[at_byte..][0..p.?.data.len], p.?.data);
+            at_byte += p.?.data.len;
+        }
+        const key = gop.key_ptr.*;
+        self.parts.removeByPtr(gop.key_ptr);
+        self.allocator.free(key);
+        return .{ .dims = .{ t.dims[0], rows, 1, 1 }, .n_dims = 2, .ty = t.ty, .data = data };
+    }
+
+    fn pending(self: *const Joins) usize {
+        return self.parts.count();
+    }
+
+    fn deinit(self: *Joins) void {
+        var it = self.parts.keyIterator();
+        while (it.next()) |k| self.allocator.free(k.*);
+        self.parts.deinit(self.allocator);
+    }
+};
+
+/// A metadata integer array as an int64 [len] array.
+fn int64Vector(arr: gguf.Array) !mlx.mlx_array {
+    if (!arr.isInt()) return error.BadMetadata;
+    var vals: [64]i64 = undefined;
+    if (arr.len > vals.len) return error.BadMetadata;
+    for (vals[0..arr.len], 0..) |*v, j| v.* = arr.int(j);
+    return mlx.mlx_array_new_data(&vals, &[_]c_int{@intCast(arr.len)}, 1, .int64);
 }
 
 /// The MTP head a dense qwen35 file keeps after its trunk (`qwen35.hasMtpHead`),
@@ -279,7 +350,7 @@ fn loadFloat(allocator: std.mem.Allocator, t: gguf.Tensor, transform: arch_mod.T
             break :blk mlx.mlx_array_new_data(tmp.ptr, if (transform == .neg_log) &flat else shape.ptr, if (transform == .neg_log) 1 else @intCast(shape.len), dtype);
         },
         .flatten => mlx.mlx_array_new_data(t.data.ptr, &[_]c_int{@intCast(t.elems())}, 1, dtype),
-        .split_ba => return error.UnsupportedTensor,
+        .split_ba, .join_rows => return error.UnsupportedTensor,
         // Un-tiling only moves bytes, so it works the same on any float type.
         .untile_rows, .untile_vec, .a_log, .conv1d, .tiled_input => blk: {
             const tmp = try allocator.alignedAlloc(u8, .@"4", t.data.len);
@@ -587,6 +658,44 @@ test "weights the loader rearranges are stored split like the rest (tiled input,
     }
 }
 
+test "fused rows are joined in part order, whichever part the file lists first" {
+    const a = std.testing.allocator;
+    var joins = Joins{ .allocator = a };
+    defer joins.deinit();
+    const q_bytes = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }; // bf16 [2 rows x 2]
+    const k_bytes = [_]u8{ 9, 10, 11, 12 }; // bf16 [1 row x 2]
+    const q = gguf.Tensor{ .dims = .{ 2, 2, 1, 1 }, .n_dims = 2, .ty = .bf16, .data = &q_bytes };
+    const k = gguf.Tensor{ .dims = .{ 2, 1, 1, 1 }, .n_dims = 2, .ty = .bf16, .data = &k_bytes };
+    try std.testing.expect(try joins.add("qk.weight", .{ .part = 1, .parts = 2 }, k) == null);
+    try std.testing.expectEqual(@as(usize, 1), joins.pending());
+    const joined = (try joins.add("qk.weight", .{ .part = 0, .parts = 2 }, q)).?;
+    defer a.free(joined.data);
+    try std.testing.expectEqual(@as(usize, 0), joins.pending());
+    try std.testing.expectEqualSlices(u64, &.{ 2, 3 }, joined.dims[0..joined.n_dims]);
+    try std.testing.expectEqualSlices(u8, &(q_bytes ++ k_bytes), joined.data);
+
+    // A part seen twice, or parts of different widths, cannot be joined.
+    try std.testing.expect(try joins.add("x.weight", .{ .part = 0, .parts = 2 }, q) == null);
+    try std.testing.expectError(error.UnsupportedTensor, joins.add("x.weight", .{ .part = 0, .parts = 2 }, q));
+    const wide = gguf.Tensor{ .dims = .{ 4, 1, 1, 1 }, .n_dims = 2, .ty = .bf16, .data = &q_bytes };
+    try std.testing.expectError(error.BadShape, joins.add("x.weight", .{ .part = 1, .parts = 2 }, wide));
+}
+
+test "a metadata array becomes an int64 vector" {
+    var buf: [24]u8 = undefined;
+    for ([_]i64{ 23703573157769, -2, 7 }, 0..) |v, i| std.mem.writeInt(i64, buf[8 * i ..][0..8], v, .little);
+    const arr = try int64Vector(.{ .elem_type = .i64, .len = 3, .bytes = &buf });
+    defer _ = mlx.mlx_array_free(arr);
+    try std.testing.expectEqual(mlx.mlx_dtype.int64, mlx.mlx_array_dtype(arr));
+    try std.testing.expectEqualSlices(c_int, &.{3}, mlx.getShape(arr));
+    try mlx.check(mlx.mlx_array_eval(arr));
+    // mlx-c's typed data accessors only reinterpret the buffer.
+    const got = std.mem.bytesAsSlice(i64, @as([*]align(8) const u8, @ptrCast(@alignCast(mlx.mlx_array_data_uint8(arr).?)))[0..24]);
+    try std.testing.expectEqualSlices(i64, &.{ 23703573157769, -2, 7 }, got);
+    var fbuf: [4]u8 = undefined;
+    try std.testing.expectError(error.BadMetadata, int64Vector(.{ .elem_type = .f32, .len = 1, .bytes = &fbuf }));
+}
+
 test "real model loads into a weight map (set MLX_SERVE_GGUF_TEST_MODEL)" {
     const path = std.mem.span(std.c.getenv("MLX_SERVE_GGUF_TEST_MODEL") orelse return error.SkipZigTest);
     const a = std.testing.allocator;
@@ -650,6 +759,11 @@ test "real model loads into a weight map (set MLX_SERVE_GGUF_TEST_MODEL)" {
         .gpt_oss => |hp| {
             try std.testing.expectEqualSlices(c_int, &.{@intCast(hp.n_heads)}, mlx.getShape(map.get("model.layers.0.self_attn.sinks").?));
             try std.testing.expect(map.get("model.layers.0.mlp.experts.gate_proj.bias") != null);
+        },
+        .qwen4exp => |hp| {
+            const idx = try std.fmt.allocPrint(a, p ++ "layers.{d}.self_attn.indexer.index_qk_proj.weight", .{hp.base.full_attn_interval - 1});
+            defer a.free(idx);
+            try std.testing.expectEqual(@as(c_int, @intCast((hp.indexer_heads + 1) * hp.indexer_head_dim)), mlx.getShape(map.get(idx).?)[0]);
         },
         .gemma3 => |hp| {
             const q = map.get("model.layers.0.self_attn.q_proj.weight").?;
