@@ -796,11 +796,11 @@ test "real qwen4exp GGUF: small float tensors after the load transforms are the 
     // Norms (the convention: stored as the native pack's folded 1 + w), the inject orientation, the
     // shared gate's [1, hidden], the PLE conv's trailing axis, the GatedDeltaNet conv / A_log / dt_bias un-tiling.
     const names = [_][]const u8{
-        "blk.3.indexer.q_norm.weight",    "blk.3.indexer.k_norm.weight", "blk.3.attn_q_norm.weight",       "blk.3.attn_k_norm.weight",
-        "blk.0.hc_attn_norm.weight",      "blk.0.hc_ffn_norm.weight",    "output_hc_norm.weight",          "blk.1.ple_norm_conv.weight",
-        "blk.1.ple_norm_key.weight",      "blk.1.ple_norm_query.weight", "blk.0.ssm_norm.weight",          "blk.0.hc_attn_inject.weight",
-        "blk.1.hc_ffn_inject.weight",     "blk.0.ffn_gate_inp_shexp.weight", "blk.1.ple_conv1d.weight",     "blk.0.ssm_conv1d.weight",
-        "blk.0.ssm_a",                    "blk.0.ssm_dt.bias",
+        "blk.3.indexer.q_norm.weight", "blk.3.indexer.k_norm.weight",     "blk.3.attn_q_norm.weight", "blk.3.attn_k_norm.weight",
+        "blk.0.hc_attn_norm.weight",   "blk.0.hc_ffn_norm.weight",        "output_hc_norm.weight",    "blk.1.ple_norm_conv.weight",
+        "blk.1.ple_norm_key.weight",   "blk.1.ple_norm_query.weight",     "blk.0.ssm_norm.weight",    "blk.0.hc_attn_inject.weight",
+        "blk.1.hc_ffn_inject.weight",  "blk.0.ffn_gate_inp_shexp.weight", "blk.1.ple_conv1d.weight",  "blk.0.ssm_conv1d.weight",
+        "blk.0.ssm_a",                 "blk.0.ssm_dt.bias",
     };
     var name_buf: [160]u8 = undefined;
     var failed = false;
