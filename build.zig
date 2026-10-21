@@ -6,6 +6,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const model = b.option([]const u8, "model", "GGUF file for the real-file tests");
+    // Run-step env is fixed when the build graph is configured (and cached): pass paths as options.
+    const real = RealFiles{
+        .model = model,
+        .qwen4exp = b.option([]const u8, "qwen4exp", "Qwen3.8-Flash-Next GGUF shard 1, for its header and small-tensor tests"),
+        .native_pack = b.option([]const u8, "native-pack", "the native mlx-serve pack of the same model, for the layout oracle"),
+    };
     // The MLX bindings + staged libs come from an mlx-serve checkout (sibling
     // repo by default, pass ../.. when this is the lib/ submodule).
     const host = b.option([]const u8, "mlx-serve", "Path to an mlx-serve checkout") orelse "../mlx-serve";
@@ -18,7 +24,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     const core_step = b.step("test-core", "Run the MLX-free tests");
-    core_step.dependOn(&runTests(b, core, model).step);
+    core_step.dependOn(&runTests(b, core, real).step);
 
     // `test`: everything, kernels run on the GPU through mlx-serve's MLX.
     const mlx = b.createModule(.{
@@ -64,12 +70,16 @@ pub fn build(b: *std.Build) void {
     b.step("bench", "Time the matvec kernels against MLX's 4-bit matvec (-Dtypes=q6_k,iq4_nl)").dependOn(&run_bench.step);
 
     const test_step = b.step("test", "Run all tests (needs mlx-serve with lib/mlx staged)");
-    test_step.dependOn(&runTests(b, root, model).step);
+    test_step.dependOn(&runTests(b, root, real).step);
 }
 
-fn runTests(b: *std.Build, mod: *std.Build.Module, model: ?[]const u8) *std.Build.Step.Run {
+const RealFiles = struct { model: ?[]const u8, qwen4exp: ?[]const u8, native_pack: ?[]const u8 };
+
+fn runTests(b: *std.Build, mod: *std.Build.Module, real: RealFiles) *std.Build.Step.Run {
     const run = b.addRunArtifact(b.addTest(.{ .root_module = mod }));
-    if (model) |m| run.setEnvironmentVariable("MLX_SERVE_GGUF_TEST_MODEL", m);
+    if (real.model) |m| run.setEnvironmentVariable("MLX_SERVE_GGUF_TEST_MODEL", m);
+    if (real.qwen4exp) |m| run.setEnvironmentVariable("QWEN4EXP_GGUF_MODEL", m);
+    if (real.native_pack) |p| run.setEnvironmentVariable("QWEN4_NATIVE_PACK", p);
     // The oracles are f32 CPU dot products; on NAX GPUs MLX runs its own f32
     // GEMM (the dequant + matmul paths) as TF32 unless told otherwise.
     run.setEnvironmentVariable("MLX_ENABLE_TF32", "0");

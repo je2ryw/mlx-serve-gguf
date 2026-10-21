@@ -696,6 +696,97 @@ test "a metadata array becomes an int64 vector" {
     try std.testing.expectError(error.BadMetadata, int64Vector(.{ .elem_type = .f32, .len = 1, .bytes = &fbuf }));
 }
 
+/// One BF16 tensor of a safetensors pack, `pread` by its offsets: no other tensor is read.
+fn packBf16(a: std.mem.Allocator, pack: []const u8, name: []const u8) !struct { shape: []i64, bits: []u16 } {
+    const io = std.testing.io;
+    const idx_path = try std.fmt.allocPrint(a, "{s}/model.safetensors.index.json", .{pack});
+    defer a.free(idx_path);
+    const idx_json = try std.Io.Dir.cwd().readFileAlloc(io, idx_path, a, .limited(16 << 20));
+    defer a.free(idx_json);
+    const idx = try std.json.parseFromSlice(std.json.Value, a, idx_json, .{});
+    defer idx.deinit();
+    const shard = idx.value.object.get("weight_map").?.object.get(name) orelse return error.MissingWeight;
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ pack, shard.string }, 0);
+    defer a.free(path);
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.FileNotFound;
+    defer _ = std.c.close(fd);
+    var len_buf: [8]u8 = undefined;
+    if (std.c.pread(fd, &len_buf, 8, 0) != 8) return error.Truncated;
+    const hlen = std.mem.readInt(u64, &len_buf, .little);
+    const hdr = try a.alloc(u8, hlen);
+    defer a.free(hdr);
+    if (std.c.pread(fd, hdr.ptr, hlen, 8) != @as(isize, @intCast(hlen))) return error.Truncated;
+    const h = try std.json.parseFromSlice(std.json.Value, a, hdr, .{});
+    defer h.deinit();
+    const entry = h.value.object.get(name).?.object;
+    if (!std.mem.eql(u8, entry.get("dtype").?.string, "BF16")) return error.UnsupportedTensor;
+    const shape_json = entry.get("shape").?.array.items;
+    const shape = try a.alloc(i64, shape_json.len);
+    errdefer a.free(shape);
+    for (shape, shape_json) |*d, v| d.* = v.integer;
+    const offs = entry.get("data_offsets").?.array.items;
+    const nbytes: usize = @intCast(offs[1].integer - offs[0].integer);
+    const bits = try a.alloc(u16, nbytes / 2);
+    errdefer a.free(bits);
+    if (std.c.pread(fd, @ptrCast(bits.ptr), nbytes, @intCast(8 + hlen + @as(u64, @intCast(offs[0].integer)))) != @as(isize, @intCast(nbytes))) return error.Truncated;
+    return .{ .shape = shape, .bits = bits };
+}
+
+test "real qwen4exp GGUF: small float tensors after the load transforms are the native pack's bf16 (set QWEN4EXP_GGUF_MODEL and QWEN4_NATIVE_PACK)" {
+    const path = std.mem.span(std.c.getenv("QWEN4EXP_GGUF_MODEL") orelse return error.SkipZigTest);
+    const pack = std.mem.span(std.c.getenv("QWEN4_NATIVE_PACK") orelse return error.SkipZigTest);
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var f = try gguf.File.open(a, path);
+    defer f.deinit();
+    const arch = try Arch.read(&f);
+    // Norms (the convention: stored as the native pack's folded 1 + w), the inject orientation, the
+    // shared gate's [1, hidden], the PLE conv's trailing axis, the GatedDeltaNet conv / A_log / dt_bias un-tiling.
+    const names = [_][]const u8{
+        "blk.3.indexer.q_norm.weight",    "blk.3.indexer.k_norm.weight", "blk.3.attn_q_norm.weight",       "blk.3.attn_k_norm.weight",
+        "blk.0.hc_attn_norm.weight",      "blk.0.hc_ffn_norm.weight",    "output_hc_norm.weight",          "blk.1.ple_norm_conv.weight",
+        "blk.1.ple_norm_key.weight",      "blk.1.ple_norm_query.weight", "blk.0.ssm_norm.weight",          "blk.0.hc_attn_inject.weight",
+        "blk.1.hc_ffn_inject.weight",     "blk.0.ffn_gate_inp_shexp.weight", "blk.1.ple_conv1d.weight",     "blk.0.ssm_conv1d.weight",
+        "blk.0.ssm_a",                    "blk.0.ssm_dt.bias",
+    };
+    var name_buf: [160]u8 = undefined;
+    var failed = false;
+    for (names) |name| {
+        const t = f.tensors.get(name) orelse return error.MissingWeight;
+        const mapped = arch.mapTensor(&name_buf, name).?;
+        const loaded = try loadFloat(a, t, mapped.transform, arch.gdn(), s);
+        defer _ = mlx.mlx_array_free(loaded);
+        var got = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(got);
+        try mlx.check(mlx.mlx_astype(&got, loaded, .bfloat16, s));
+        try mlx.check(mlx.mlx_array_eval(got));
+        const want = try packBf16(a, pack, mapped.name);
+        defer a.free(want.shape);
+        defer a.free(want.bits);
+        const shape = mlx.getShape(got);
+        var same_shape = shape.len == want.shape.len;
+        if (same_shape) for (shape, want.shape) |g, w| {
+            same_shape = same_shape and g == w;
+        };
+        const bits = mlx.mlx_array_data_bfloat16(got).?[0..mlx.mlx_array_size(got)];
+        var equal: usize = 0;
+        if (same_shape) for (bits, want.bits) |g, w| {
+            const gf: f32 = @bitCast(@as(u32, g) << 16);
+            const wf: f32 = @bitCast(@as(u32, w) << 16);
+            // An F16 tensor (ple_conv1d) holds values below 2^-14 in 2^-24 steps: the converter's cast, not ours.
+            const f16_subnormal = t.ty == .f16 and @abs(wf) < 0x1p-14 and @abs(gf - wf) <= 0x1p-24;
+            equal += @intFromBool(g == w or f16_subnormal);
+        };
+        if (!same_shape or equal != want.bits.len) {
+            std.debug.print("{s} -> {s}: shape {any} vs {any}, {d}/{d} bf16-equal\n", .{ name, mapped.name, shape, want.shape, equal, want.bits.len });
+            failed = true;
+        }
+    }
+    if (failed) return error.TestExpectedEqual;
+}
+
 test "real model loads into a weight map (set MLX_SERVE_GGUF_TEST_MODEL)" {
     const path = std.mem.span(std.c.getenv("MLX_SERVE_GGUF_TEST_MODEL") orelse return error.SkipZigTest);
     const a = std.testing.allocator;
