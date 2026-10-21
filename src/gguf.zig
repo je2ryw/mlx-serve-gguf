@@ -11,7 +11,13 @@ pub const Error = error{
     BadValueType,
     BadTensor,
     DuplicateKey,
+    /// A split GGUF opens from its first shard only.
+    SplitNotFirstShard,
+    /// A split GGUF whose shards, names or tensor counts disagree.
+    BadSplit,
 } || std.mem.Allocator.Error;
+
+const Map = []align(std.heap.page_size_min) const u8;
 
 const ValueType = enum(u32) { u8, i8, u16, i16, u32, i32, f32, bool, string, array, u64, i64, f64, _ };
 
@@ -160,13 +166,32 @@ const Reader = struct {
 
 pub const File = struct {
     arena: std.heap.ArenaAllocator,
-    /// Non-null when we own an mmap (open), null for parse() over caller bytes.
-    map: ?[]align(std.heap.page_size_min) const u8 = null,
+    /// The mmaps we own (open: one per shard), none for parse() over caller bytes.
+    maps: []const Map = &.{},
     version: u32,
     kv: std.StringHashMapUnmanaged(Value) = .empty,
     tensors: std.StringArrayHashMapUnmanaged(Tensor) = .empty,
 
+    /// A shard of a split GGUF (`<prefix>-00001-of-0000N.gguf`, split.count
+    /// N > 1) opens its siblings too: one tensor table over every shard, the
+    /// metadata of the first.
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !File {
+        const first = try mapFile(path);
+        var f = parse(allocator, first) catch |err| {
+            std.posix.munmap(first);
+            return err;
+        };
+        f.maps = f.arena.allocator().dupe(Map, &.{first}) catch |err| {
+            std.posix.munmap(first);
+            f.deinit();
+            return err;
+        };
+        errdefer f.deinit();
+        try f.openSiblings(path);
+        return f;
+    }
+
+    fn mapFile(path: []const u8) !Map {
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
         if (path.len >= pbuf.len) return error.NameTooLong;
         @memcpy(pbuf[0..path.len], path);
@@ -177,11 +202,37 @@ pub const File = struct {
         // lseek, not fstat: std.c.fstat is void on Linux in Zig 0.17.
         const size = std.c.lseek(fd, 0, std.c.SEEK.END);
         if (size < 0) return error.StatFailed;
-        const map = try std.posix.mmap(null, @intCast(size), .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
-        errdefer std.posix.munmap(map);
-        var f = try parse(allocator, map);
-        f.map = map;
-        return f;
+        return std.posix.mmap(null, @intCast(size), .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
+    }
+
+    /// Shards are named like llama.cpp's `llama_split_path`; the others carry
+    /// only the split.* keys, so their metadata is not merged.
+    fn openSiblings(self: *File, path: []const u8) !void {
+        const count = self.getInt("split.count") orelse return;
+        if (count <= 1) return;
+        if (self.getInt("split.no") != 0) return error.SplitNotFirstShard;
+        const n = std.math.cast(usize, count) orelse return error.BadSplit;
+        const a = self.arena.allocator();
+        const suffix = try std.fmt.allocPrint(a, "-00001-of-{d:0>5}.gguf", .{n});
+        if (!std.mem.endsWith(u8, path, suffix)) return error.BadSplit;
+        const maps = try a.alloc(Map, n);
+        maps[0] = self.maps[0];
+        for (1..n) |i| {
+            const sibling = try std.fmt.allocPrint(a, "{s}-{d:0>5}-of-{d:0>5}.gguf", .{ path[0 .. path.len - suffix.len], i + 1, n });
+            maps[i] = try mapFile(sibling);
+            self.maps = maps[0 .. i + 1];
+            var shard = try parse(self.arena.child_allocator, maps[i]);
+            defer shard.deinit();
+            if (shard.getInt("split.no") != @as(i64, @intCast(i)) or shard.getInt("split.count") != count) return error.BadSplit;
+            var it = shard.tensors.iterator();
+            while (it.next()) |e| {
+                // Names and data are slices of the shard's map, which we own now.
+                const gop = try self.tensors.getOrPut(a, e.key_ptr.*);
+                if (gop.found_existing) return error.BadSplit;
+                gop.value_ptr.* = e.value_ptr.*;
+            }
+        }
+        if (self.getInt("split.tensors.count")) |total| if (total != self.tensors.count()) return error.BadSplit;
     }
 
     /// `bytes` must outlive the File.
@@ -236,8 +287,8 @@ pub const File = struct {
     }
 
     pub fn deinit(self: *File) void {
+        for (self.maps) |m| std.posix.munmap(m);
         self.arena.deinit();
-        if (self.map) |m| std.posix.munmap(m);
     }
 
     pub fn getString(self: *const File, key: []const u8) ?[]const u8 {
@@ -340,6 +391,126 @@ test "parse rejects a file cut short anywhere" {
             @constCast(f).deinit();
             return error.TestExpectedError;
         } else |_| {}
+    }
+}
+
+const TestShard = struct {
+    no: u16,
+    count: u16,
+    total: i32,
+    /// Q8_0 [32 x 2] tensors, every data byte = `fill`.
+    tensors: []const struct { name: []const u8, fill: u8 },
+};
+
+/// One shard of a split GGUF as llama.cpp writes it: the first shard carries
+/// the model metadata, every shard the three split.* keys.
+fn buildShard(w: *TestWriter, sh: TestShard) !void {
+    try w.buf.appendSlice(w.a, "GGUF");
+    try w.num(@as(u32, 3));
+    try w.num(@as(u64, sh.tensors.len));
+    try w.num(@as(u64, if (sh.no == 0) 4 else 3));
+    if (sh.no == 0) {
+        try w.str("general.architecture");
+        try w.num(@as(u32, 8));
+        try w.str("qwen35");
+    }
+    try w.str("split.no");
+    try w.num(@as(u32, 2));
+    try w.num(sh.no);
+    try w.str("split.count");
+    try w.num(@as(u32, 2));
+    try w.num(sh.count);
+    try w.str("split.tensors.count");
+    try w.num(@as(u32, 5));
+    try w.num(sh.total);
+    for (sh.tensors, 0..) |t, i| {
+        try w.str(t.name);
+        try w.num(@as(u32, 2));
+        try w.num(@as(u64, 32));
+        try w.num(@as(u64, 2));
+        try w.num(@as(u32, 8));
+        try w.num(@as(u64, 96 * i));
+    }
+    for (sh.tensors) |t| {
+        while (w.buf.items.len % 32 != 0) try w.buf.append(w.a, 0);
+        try w.buf.appendNTimes(w.a, t.fill, 68);
+    }
+}
+
+/// Writes `shards` as `<dir>/<names[i]>`, returns the directory's absolute path.
+fn writeShards(dir: std.testing.TmpDir, names: []const []const u8, shards: []const TestShard, path_buf: []u8) ![]const u8 {
+    const io = std.testing.io;
+    for (names, shards) |name, sh| {
+        var w = TestWriter{};
+        defer w.buf.deinit(w.a);
+        try buildShard(&w, sh);
+        try dir.dir.writeFile(io, .{ .sub_path = name, .data = w.buf.items });
+    }
+    return path_buf[0..try dir.dir.realPath(io, path_buf)];
+}
+
+const shard_names = [_][]const u8{ "m-00001-of-00002.gguf", "m-00002-of-00002.gguf" };
+
+test "a split GGUF opens from its first shard as one tensor table over every shard" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try writeShards(tmp, &shard_names, &.{
+        .{ .no = 0, .count = 2, .total = 3, .tensors = &.{ .{ .name = "token_embd.weight", .fill = 1 }, .{ .name = "blk.0.ffn_up.weight", .fill = 2 } } },
+        .{ .no = 1, .count = 2, .total = 3, .tensors = &.{.{ .name = "per_layer_token_embd.weight", .fill = 3 }} },
+    }, &buf);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ root, shard_names[0] });
+    defer std.testing.allocator.free(path);
+
+    var f = try File.open(std.testing.allocator, path);
+    defer f.deinit();
+    try std.testing.expectEqualStrings("qwen35", f.getString("general.architecture").?);
+    try std.testing.expectEqual(@as(usize, 3), f.tensors.count());
+    for ([_][]const u8{ "token_embd.weight", "blk.0.ffn_up.weight", "per_layer_token_embd.weight" }, 1..) |name, fill| {
+        const t = f.tensors.get(name).?;
+        try std.testing.expectEqual(@as(usize, 68), t.data.len);
+        for (t.data) |b| try std.testing.expectEqual(@as(u8, @intCast(fill)), b);
+    }
+}
+
+test "a later shard opened directly is refused by name" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try writeShards(tmp, &shard_names, &.{
+        .{ .no = 0, .count = 2, .total = 2, .tensors = &.{.{ .name = "a.weight", .fill = 1 }} },
+        .{ .no = 1, .count = 2, .total = 2, .tensors = &.{.{ .name = "b.weight", .fill = 2 }} },
+    }, &buf);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ root, shard_names[1] });
+    defer std.testing.allocator.free(path);
+    try std.testing.expectError(error.SplitNotFirstShard, File.open(std.testing.allocator, path));
+}
+
+test "a split set that does not add up is refused" {
+    const Case = struct { names: []const []const u8, shards: []const TestShard, want: anyerror };
+    const a1 = [_]TestShard{.{ .no = 0, .count = 2, .total = 2, .tensors = &.{.{ .name = "a.weight", .fill = 1 }} }};
+    const cases = [_]Case{
+        // the second shard is missing
+        .{ .names = shard_names[0..1], .shards = &a1, .want = error.FileNotFound },
+        // the sibling disagrees on the shard count
+        .{ .names = &shard_names, .shards = &.{ a1[0], .{ .no = 1, .count = 3, .total = 2, .tensors = &.{.{ .name = "b.weight", .fill = 2 }} } }, .want = error.BadSplit },
+        // the sibling claims to be the first shard
+        .{ .names = &shard_names, .shards = &.{ a1[0], .{ .no = 0, .count = 2, .total = 2, .tensors = &.{.{ .name = "b.weight", .fill = 2 }} } }, .want = error.BadSplit },
+        // fewer tensors than split.tensors.count
+        .{ .names = &shard_names, .shards = &.{ .{ .no = 0, .count = 2, .total = 3, .tensors = &.{.{ .name = "a.weight", .fill = 1 }} }, .{ .no = 1, .count = 2, .total = 3, .tensors = &.{.{ .name = "b.weight", .fill = 2 }} } }, .want = error.BadSplit },
+        // the same tensor in two shards
+        .{ .names = &shard_names, .shards = &.{ a1[0], .{ .no = 1, .count = 2, .total = 2, .tensors = &.{.{ .name = "a.weight", .fill = 2 }} } }, .want = error.BadSplit },
+        // split.count > 1 on a file not named like a shard
+        .{ .names = &.{"m.gguf"}, .shards = &a1, .want = error.BadSplit },
+    };
+    for (cases) |c| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const root = try writeShards(tmp, c.names, c.shards, &buf);
+        const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ root, c.names[0] });
+        defer std.testing.allocator.free(path);
+        try std.testing.expectError(c.want, File.open(std.testing.allocator, path));
     }
 }
 
