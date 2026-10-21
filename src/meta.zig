@@ -36,7 +36,7 @@ pub fn hasMtpHead(f: *const gguf.File) bool {
 /// config also carries its `vision_config` and the vision token ids, as an HF
 /// checkpoint of the same model does; the arch modules never see the tower.
 pub fn configJson(allocator: std.mem.Allocator, f: *const gguf.File, mmproj: ?*const gguf.File) ![]u8 {
-    const cfg = try (try Arch.read(f)).configJson(allocator);
+    const cfg = try (try Arch.read(f)).configJson(allocator, f);
     const mm = mmproj orelse return cfg;
     defer allocator.free(cfg);
     const parsed = try std.json.parseFromSlice(struct { model_type: []const u8 }, allocator, cfg, .{ .ignore_unknown_fields = true });

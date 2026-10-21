@@ -40,7 +40,7 @@ MTP: the head a dense Qwen3.5 / Qwen3.8 file keeps after its trunk (`blk.<n_laye
 
 Not done: other mmproj projectors (deepstack, Gemma, ...), MoE MTP heads.
 
-In progress: Qwen3.8-Flash-Next (`qwen4exp`, a split GGUF opened from its first shard). Hparams, config.json and the tensor map are here; its n-gram table (`per_layer_token_embd`) is never loaded, mlx-serve reads it row by row.
+In progress: Qwen3.8-Flash-Next (`qwen4exp`, a split GGUF opened from its first shard). Hparams, config.json and the tensor map are here; its n-gram table (`per_layer_token_embd`, IQ4_NL) is never loaded: the config's `ngram_table` names the shard and offset, and mlx-serve reads the rows in place.
 
 What is where:
 

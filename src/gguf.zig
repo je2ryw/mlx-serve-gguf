@@ -174,8 +174,9 @@ const Reader = struct {
 
 pub const File = struct {
     arena: std.heap.ArenaAllocator,
-    /// The mmaps we own (open: one per shard), none for parse() over caller bytes.
+    /// The mmaps we own (open: one per shard) and their files, none for parse() over caller bytes.
     maps: []const Map = &.{},
+    paths: []const []const u8 = &.{},
     version: u32,
     kv: std.StringHashMapUnmanaged(Value) = .empty,
     tensors: std.StringArrayHashMapUnmanaged(Tensor) = .empty,
@@ -195,6 +196,7 @@ pub const File = struct {
             return err;
         };
         errdefer f.deinit();
+        f.paths = try f.arena.allocator().dupe([]const u8, &.{try f.arena.allocator().dupe(u8, path)});
         try f.openSiblings(path);
         return f;
     }
@@ -224,11 +226,14 @@ pub const File = struct {
         const suffix = try std.fmt.allocPrint(a, "-00001-of-{d:0>5}.gguf", .{n});
         if (!std.mem.endsWith(u8, path, suffix)) return error.BadSplit;
         const maps = try a.alloc(Map, n);
+        const paths = try a.alloc([]const u8, n);
         maps[0] = self.maps[0];
+        paths[0] = self.paths[0];
         for (1..n) |i| {
-            const sibling = try std.fmt.allocPrint(a, "{s}-{d:0>5}-of-{d:0>5}.gguf", .{ path[0 .. path.len - suffix.len], i + 1, n });
-            maps[i] = try mapFile(sibling);
+            paths[i] = try std.fmt.allocPrint(a, "{s}-{d:0>5}-of-{d:0>5}.gguf", .{ path[0 .. path.len - suffix.len], i + 1, n });
+            maps[i] = try mapFile(paths[i]);
             self.maps = maps[0 .. i + 1];
+            self.paths = paths[0 .. i + 1];
             var shard = try parse(self.arena.child_allocator, maps[i]);
             defer shard.deinit();
             if (shard.getInt("split.no") != @as(i64, @intCast(i)) or shard.getInt("split.count") != count) return error.BadSplit;
@@ -292,6 +297,16 @@ pub const File = struct {
             try f.tensors.put(a, p.name, t);
         }
         return f;
+    }
+
+    /// The file holding `t` and its byte offset there; null for parse() over caller bytes.
+    pub fn locate(self: *const File, t: Tensor) ?struct { path: []const u8, offset: u64 } {
+        const at = @intFromPtr(t.data.ptr);
+        for (self.maps, self.paths) |m, p| {
+            const base = @intFromPtr(m.ptr);
+            if (at >= base and at + t.data.len <= base + m.len) return .{ .path = p, .offset = at - base };
+        }
+        return null;
     }
 
     pub fn deinit(self: *File) void {
@@ -496,6 +511,13 @@ test "a split GGUF opens from its first shard as one tensor table over every sha
         try std.testing.expectEqual(@as(usize, 68), t.data.len);
         for (t.data) |b| try std.testing.expectEqual(@as(u8, @intCast(fill)), b);
     }
+    // Where a tensor lives: the shard's path and the tensor's offset in it.
+    const at = f.locate(f.tensors.get("per_layer_token_embd.weight").?).?;
+    try std.testing.expect(std.mem.endsWith(u8, at.path, shard_names[1]));
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, at.path, std.testing.allocator, .limited(1 << 20));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualSlices(u8, &@as([68]u8, @splat(3)), bytes[at.offset..][0..68]);
+    try std.testing.expectEqualStrings(path, f.locate(f.tensors.get("token_embd.weight").?).?.path);
 }
 
 test "a later shard opened directly is refused by name" {

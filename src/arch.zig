@@ -75,7 +75,7 @@ pub const Arch = union(enum) {
     }
 
     /// The config.json an mlx-community conversion of the same model would carry.
-    pub fn configJson(self: Arch, allocator: std.mem.Allocator) ![]u8 {
+    pub fn configJson(self: Arch, allocator: std.mem.Allocator, f: *const gguf.File) ![]u8 {
         return switch (self) {
             .qwen35 => |hp| qwen35.configJson(allocator, hp),
             .gemma4 => |hp| gemma4.configJson(allocator, hp),
@@ -84,7 +84,7 @@ pub const Arch = union(enum) {
             .gpt_oss => |hp| gpt_oss.configJson(allocator, hp),
             .nemotron_h => |hp| nemotron_h.configJson(allocator, hp),
             .qwen3next => |hp| qwen3next.configJson(allocator, hp),
-            .qwen4exp => |hp| qwen4exp.configJson(allocator, hp),
+            .qwen4exp => |hp| qwen4exp.configJson(allocator, hp, try qwen4exp.tableFile(f)),
         };
     }
 

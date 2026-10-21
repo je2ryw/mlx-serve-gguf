@@ -40,6 +40,7 @@ pub const Hparams = struct {
     ple_conv_kernel: u32,
     /// One n-gram head's embedding width: a table row.
     ple_head_dim: u32,
+    table_rows: u64,
     /// The n-gram hash's eos (HF's `text_config.eos_token_id`), not the chat terminator.
     ngram_eos: u32,
     bos: u32,
@@ -65,10 +66,12 @@ pub const Hparams = struct {
             .ngram_eos = try k.int("ple.eos_token_id"),
             .bos = try arch.u32Key(f, "tokenizer.ggml.bos_token_id"),
             .vision = try visionTokens(f),
+            .table_rows = (f.tensors.get("per_layer_token_embd.weight") orelse return error.MissingMetadata).dims[1],
         };
         if (hp.vision.image != try k.int("ple.image_token_id")) return error.BadMetadata;
-        const table = f.tensors.get("per_layer_token_embd.weight") orelse return error.MissingMetadata;
-        if (table.n_dims != 2 or table.dims[0] != hp.ple_head_dim) return error.BadMetadata;
+        const table = f.tensors.get("per_layer_token_embd.weight").?;
+        // mlx-serve's table arm reads IQ4_NL rows.
+        if (table.n_dims != 2 or table.dims[0] != hp.ple_head_dim or table.ty != .iq4_nl) return error.BadMetadata;
         const ngram = NgramMeta{
             .multipliers = k.array("ple.layer_multipliers") orelse return error.MissingMetadata,
             .offsets = k.array("ple.head_offsets") orelse return error.MissingMetadata,
@@ -144,15 +147,26 @@ const NgramMeta = struct {
     }
 };
 
+/// Where the n-gram table's rows sit: mlx-serve reads them in place off this file.
+pub const TableFile = struct { path: []const u8, offset: u64 };
+
+pub fn tableFile(f: *const gguf.File) !TableFile {
+    const at = f.locate(f.tensors.get("per_layer_token_embd.weight") orelse return error.MissingMetadata) orelse return error.MissingMetadata;
+    return .{ .path = at.path, .offset = at.offset };
+}
+
 /// The config.json of the native packs, without the MTP head (the GGUF has
-/// none) and the vision tower (the mmproj's).
-pub fn configJson(allocator: std.mem.Allocator, hp: Hparams) ![]u8 {
+/// none) and the vision tower (the mmproj's), plus where the table is.
+pub fn configJson(allocator: std.mem.Allocator, hp: Hparams, table: TableFile) ![]u8 {
     const b = hp.base;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.print(allocator,
+        \\{{"ngram_table":{{"file":{f},"format":"gguf_iq4_nl","offset":{d},"rows":{d},"dim":{d}}},
+    , .{ std.json.fmt(table.path, .{}), table.offset, hp.table_rows, hp.ple_head_dim });
+    try out.print(allocator,
         // Norms stored folded (1 + w) like the native packs: weights.zig's "small float tensors ... native pack's bf16" test.
-        \\{{"architectures":["Qwen4ExpForConditionalGeneration"],"model_type":"qwen4_exp","language_model_only":false,
+        \\"architectures":["Qwen4ExpForConditionalGeneration"],"model_type":"qwen4_exp","language_model_only":false,
         \\"qwen4_norm_convention":"folded",
         \\"tie_word_embeddings":{[tied]},"image_token_id":{[image]d},"video_token_id":{[video]d},
         \\"vision_start_token_id":{[vstart]d},"vision_end_token_id":{[vend]d},
@@ -337,6 +351,7 @@ fn testHparams() Hparams {
         .heads_per_ngram = 8,
         .ple_conv_kernel = 4,
         .ple_head_dim = 160,
+        .table_rows = 320001536,
         .ngram_eos = 248044,
         .bos = 248044,
         .vision = .{ .image = 248056, .video = 248057, .start = 248053, .end = 248054 },
@@ -429,7 +444,7 @@ test "the n-gram metadata must be the hash mlx-serve derives: one multiplier per
 }
 
 test "configJson carries the native pack's text_config, no MTP and no vision_config" {
-    const json = try configJson(std.testing.allocator, testHparams());
+    const json = try configJson(std.testing.allocator, testHparams(), .{ .path = "/m/x-00002-of-00002.gguf", .offset = 192 });
     defer std.testing.allocator.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
@@ -442,6 +457,13 @@ test "configJson carries the native pack's text_config, no MTP and no vision_con
     try std.testing.expectEqual(@as(i64, 248053), root.get("vision_start_token_id").?.integer);
     try std.testing.expectEqual(@as(i64, 248054), root.get("vision_end_token_id").?.integer);
     try std.testing.expect(root.get("vision_config") == null);
+    // mlx-serve reads the n-gram table's IQ4_NL rows in place, off the shard that holds them.
+    const table = root.get("ngram_table").?.object;
+    try std.testing.expectEqualStrings("/m/x-00002-of-00002.gguf", table.get("file").?.string);
+    try std.testing.expectEqualStrings("gguf_iq4_nl", table.get("format").?.string);
+    try std.testing.expectEqual(@as(i64, 192), table.get("offset").?.integer);
+    try std.testing.expectEqual(@as(i64, 320001536), table.get("rows").?.integer);
+    try std.testing.expectEqual(@as(i64, 160), table.get("dim").?.integer);
     try std.testing.expectEqualStrings("folded", root.get("qwen4_norm_convention").?.string);
     const tc = root.get("text_config").?.object;
     try std.testing.expectEqualStrings("qwen4_exp_text", tc.get("model_type").?.string);
