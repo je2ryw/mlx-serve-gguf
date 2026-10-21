@@ -36,7 +36,9 @@ Works end to end in mlx-serve, text only, greedy output at parity with llama.cpp
 
 Vision: a Qwen3-VL mmproj (`clip`, `qwen3vl_merger`) beside a Qwen3.5 / Qwen3.8 model gives mlx-serve its tower, dense bf16 as the HF checkpoint ships it (checked bit for bit against an MLX pack of the same checkpoint).
 
-Not done: other mmproj projectors (deepstack, Gemma, ...), MTP heads (skipped at load).
+MTP: the head a dense Qwen3.5 / Qwen3.8 file keeps after its trunk (`blk.<n_layers>`, `nextn.*`) loads on its own (`weights.loadMtp`) under the names an MLX pack's head carries, for mlx-serve's MTP drafter; the trunk load still skips it.
+
+Not done: other mmproj projectors (deepstack, Gemma, ...), MoE MTP heads.
 
 What is where:
 
