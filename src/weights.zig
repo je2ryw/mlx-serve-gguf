@@ -126,7 +126,7 @@ const Joins = struct {
 fn int64Vector(arr: gguf.Array) !mlx.mlx_array {
     if (!arr.isInt()) return error.BadMetadata;
     var vals: [64]i64 = undefined;
-    if (arr.len > vals.len) return error.BadMetadata;
+    if (arr.len > vals.len) return error.MetadataTensorTooLong;
     for (vals[0..arr.len], 0..) |*v, j| v.* = arr.int(j);
     return mlx.mlx_array_new_data(&vals, &[_]c_int{@intCast(arr.len)}, 1, .int64);
 }
@@ -745,6 +745,8 @@ test "a metadata array becomes an int64 vector" {
     try std.testing.expectEqualSlices(i64, &.{ 23703573157769, -2, 7 }, got);
     var fbuf: [4]u8 = undefined;
     try std.testing.expectError(error.BadMetadata, int64Vector(.{ .elem_type = .f32, .len = 1, .bytes = &fbuf }));
+    var long: [65 * 8]u8 = @splat(0);
+    try std.testing.expectError(error.MetadataTensorTooLong, int64Vector(.{ .elem_type = .i64, .len = 65, .bytes = &long }));
 }
 
 /// One BF16 tensor of a safetensors pack, `pread` by its offsets: no other tensor is read.

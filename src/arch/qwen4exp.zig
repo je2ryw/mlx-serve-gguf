@@ -260,6 +260,8 @@ pub fn mapTensor(buf: []u8, name: []const u8, hp: Hparams) ?arch.Mapped {
     };
     for (globals) |g| if (std.mem.eql(u8, name, g[0])) return .{ .name = g[1], .transform = .none };
     if (std.mem.eql(u8, name, "per_layer_token_embd.weight")) return arch.skip;
+    // qwen35's map skips the block past the trunk as an MTP head; this GGUF has none, so it is unknown.
+    if (arch.splitLayer(name, hp.base.n_layers + 1)) |b| if (b.layer == hp.base.n_layers) return null;
     const blk = arch.splitLayer(name, hp.base.n_layers) orelse return qwen35.mapTensor(buf, name, hp.base);
 
     const Layers = enum { all, full_attention, ple };
@@ -409,7 +411,8 @@ test "mapTensor: hyper-connections, the indexer and the PLE by layer kind, the t
     try std.testing.expectEqual(@as(u32, 2 * 16 * 128), mapTensor(&buf, "blk.0.attn_qkv.weight", hp).?.transform.untile_rows.start);
     try std.testing.expect(mapTensor(&buf, "blk.0.ssm_out.weight", hp).?.transform == .tiled_input);
     // An indexer off a full-attention layer, the PLE off its layer, a layer past the trunk: unknown.
-    for ([_][]const u8{ "blk.2.indexer.q_proj.weight", "blk.0.ple_key.weight", "blk.49.hc_attn_up.weight", "blk.1.hc_attn_gate.weight" }) |name| {
+    // blk.48 too: qwen35's map skips that block as an MTP head, and this GGUF has none.
+    for ([_][]const u8{ "blk.2.indexer.q_proj.weight", "blk.0.ple_key.weight", "blk.48.hc_attn_up.weight", "blk.48.nextn.eh_proj.weight", "blk.49.hc_attn_up.weight", "blk.1.hc_attn_gate.weight" }) |name| {
         try std.testing.expect(mapTensor(&buf, name, hp) == null);
     }
 }
